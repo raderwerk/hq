@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """Apply design/linear-spec.json to the live Linear workspace, idempotently.
 
-    python3 build_linear.py --dry-run                 # plan only, no mutation (default)
-    python3 build_linear.py --apply --backup-required # really build
-    python3 build_linear.py --apply --teardown --backup-required
+    python3 build_linear.py --dry-run --teardown --backup-required --validate
+    python3 build_linear.py --apply --teardown --probe --backup-required
     python3 build_linear.py --verify                  # compare live workspace to the spec
 
-Order: backup check -> teardown -> teams+states+settings -> labels -> initiatives ->
-projects (+milestones, +initiative link) -> templates -> documents -> issues.
+Order: workspace guard -> backup gate -> issue-budget check -> probes -> teardown
+-> teams+states+settings -> labels -> probe -> initiatives -> projects (+milestones,
++initiative link) -> templates -> documents -> issues.
 
-Nothing mutates unless --apply is given. Users are never touched.
+Nothing mutates unless --apply is given, and a dry run is a true rehearsal: the
+teardown replays itself on the in-memory snapshot, so `--dry-run --teardown`
+prints the operations `--apply --teardown` will send.
+
+Users are never touched.
 """
 
 import argparse
@@ -19,25 +23,32 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from linear_api import LinearError, gql, page, stats  # noqa: E402
+from linear_api import (LinearError, gql, key_source, last_headers,  # noqa: E402
+                        page, stats)
+import linear_check  # noqa: E402
+import linear_guard  # noqa: E402
+from linear_common import TEAM_SETTINGS, Plan, label_key, norm  # noqa: E402
+from linear_probe import Probe  # noqa: E402
+from linear_teardown import LEGACY_TEAM_ID, Teardown  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SPEC_PATH = os.path.join(ROOT, "design", "linear-spec.json")
-BACKUP_PATH = os.path.join(ROOT, "linear", "backup-2026-09-02.json")
+BACKUP_DIR = os.path.join(ROOT, "linear")
 IDMAP_PATH = os.path.join(ROOT, "linear", "idmap.json")
 
-TEARDOWN_INITIATIVE = "Fightclub AI"
 PLAN_LIMIT_RETRIES = 8
 PLAN_LIMIT_WAIT = 15
-TEAM_DELETE_POLL_SECONDS = 120
-ISSUE_DELETE_BATCH = 20
 
-TEAM_SETTINGS = ("description", "icon", "color", "cyclesEnabled", "triageEnabled",
-                 "issueEstimationType")
+# Free plan. Creating an issue raises organization.createdIssueCount; whether
+# deleting one lowers it again is what the probe and the teardown measure.
+FREE_PLAN_ISSUE_CAP = 250
+PROBE_ISSUE_ALLOWANCE = 5
 
-# What teamCreate seeds a new team with (verified against this workspace's existing teams).
-# `Triage` only appears when triageEnabled is on; `triage` and `duplicate` types cannot be
-# created through workflowStateCreate, so the spec's triage state has to reuse this one.
+# Linear owns these two state types: they cannot be created, and it refuses to
+# archive them, so the reconciliation leaves them alone.
+PROTECTED_STATE_TYPES = ("triage", "duplicate")
+
+# What teamCreate seeds a new team with (verified against this workspace).
 DEFAULT_TEAM_STATES = [
     {"name": "Triage", "type": "triage", "position": 0},
     {"name": "Backlog", "type": "backlog", "position": 0},
@@ -49,56 +60,20 @@ DEFAULT_TEAM_STATES = [
 ]
 
 
-def norm(value):
-    return " ".join((value or "").split()).strip().lower()
-
-
-class Plan(object):
-    """Records every intended change so --dry-run can print it and --apply can log it."""
-
-    def __init__(self):
-        self.entries = []
-        self.problems = []
-
-    def add(self, op, kind, name, detail="", query=None, variables=None, weight=1):
-        self.entries.append({"op": op, "kind": kind, "name": name, "detail": detail,
-                             "query": query, "variables": variables, "weight": weight})
-
-    def problem(self, text):
-        if text not in self.problems:
-            self.problems.append(text)
-
-    def counts(self):
-        out = {}
-        for e in self.entries:
-            out.setdefault((e["kind"], e["op"]), 0)
-            out[(e["kind"], e["op"])] += e.get("weight", 1)
-        return out
-
-    def render(self, verbose=True):
-        lines = []
-        if verbose:
-            for e in self.entries:
-                detail = (" -- " + e["detail"]) if e["detail"] else ""
-                lines.append("  %-7s %-14s %s%s" % (e["op"], e["kind"], e["name"], detail))
-        lines.append("")
-        lines.append("  %-14s %-7s %s" % ("KIND", "OP", "COUNT"))
-        for (kind, op), n in sorted(self.counts().items()):
-            lines.append("  %-14s %-7s %d" % (kind, op, n))
-        lines.append("  %-14s %-7s %d"
-                     % ("TOTAL", "", sum(e.get("weight", 1) for e in self.entries)))
-        return "\n".join(lines)
-
-
 class Builder(object):
-    def __init__(self, spec, apply_changes, teardown, verbose=True):
+    def __init__(self, spec, apply_changes, teardown, verbose=True, probe=False,
+                 idmap_path=IDMAP_PATH, allow_tight_budget=False):
         self.spec = spec
         self.apply = apply_changes
         self.teardown = teardown
         self.verbose = verbose
+        self.probe = probe
+        self.idmap_path = idmap_path
+        self.allow_tight_budget = allow_tight_budget
         self.plan = Plan()
         self.ids = {}          # "kind:key" -> linear id (or a <dry:...> placeholder)
         self.snapshot = {}
+        self.probe_results = {}
         self.spec_team_keys = [t["key"] for t in spec.get("teams", [])]
 
     # ---------- id bookkeeping ----------
@@ -115,20 +90,62 @@ class Builder(object):
     def is_placeholder(self, value):
         return isinstance(value, str) and value.startswith("<dry:")
 
+    def assert_no_placeholders(self, variables):
+        """A dry-run placeholder in a real payload means an id we never got back."""
+        def walk(node, path):
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    walk(value, "%s.%s" % (path, key))
+            elif isinstance(node, list):
+                for index, value in enumerate(node):
+                    walk(value, "%s[%d]" % (path, index))
+            elif self.is_placeholder(node):
+                raise LinearError("refusing to send %s=%s: that is a dry-run placeholder, so an "
+                                  "earlier mutation never returned an id" % (path, node))
+        walk(variables, "vars")
+
     # ---------- mutation plumbing ----------
 
-    def mutate(self, kind, op, name, query, variables, result_path, detail=""):
+    def mutate(self, kind, op, name, query, variables, result_path, detail="",
+               tolerate=False, record=True):
         """Record the action; execute it only when --apply is on. Returns the payload."""
-        self.plan.add(op, kind, name, detail, query=query, variables=variables)
+        if "success" not in query:
+            raise ValueError("the mutation for %s %s must select `success`" % (op, kind))
+        if record:
+            self.plan.add(op, kind, name, detail, query=query, variables=variables)
         if not self.apply:
             return None
-        data = gql(query, variables)
-        node = data
-        for part in result_path.split("."):
-            node = (node or {}).get(part)
+        try:
+            node = self.execute(query, variables, result_path)
+        except LinearError as exc:
+            if not tolerate:
+                raise
+            self.plan.problem("%s %s %r was refused (%s); continuing" % (op, kind, name, exc))
+            return None
         if self.verbose:
             sys.stderr.write("  %s %s %s\n" % (op, kind, name))
             sys.stderr.flush()
+        return node
+
+    def execute(self, query, variables, result_path):
+        """Send one mutation and insist that it actually did something."""
+        self.assert_no_placeholders(variables)
+        data = gql(query, variables, retry_transport=False)
+        root = result_path.split(".")[0]
+        payload = (data or {}).get(root)
+        if not isinstance(payload, dict):
+            raise LinearError("mutation %s returned no payload" % root,
+                              query=query, variables=variables)
+        if not payload.get("success"):
+            raise LinearError("mutation %s reported success=%r" % (root, payload.get("success")),
+                              query=query, variables=variables)
+        node = data
+        for part in result_path.split("."):
+            node = (node or {}).get(part)
+        if node is None:
+            raise LinearError("mutation %s succeeded but returned a null %s -- refusing to carry "
+                              "on with an unknown id" % (root, result_path),
+                              query=query, variables=variables)
         return node
 
     @staticmethod
@@ -146,21 +163,32 @@ class Builder(object):
                 out[key] = value
         return out
 
+    def checkpoint(self):
+        """Persist the id map mid-run, so a crash still leaves a trail."""
+        if self.apply:
+            self.write_idmap(self.idmap_path)
+
     # ---------- reading the live workspace ----------
 
     def load_snapshot(self):
         sys.stderr.write("Reading live workspace ...\n")
         snap = {}
-        snap["viewer"] = gql("query { viewer { id name email } }")["viewer"]
+        head = gql("query { viewer { id name email } "
+                   "organization { id name urlKey createdIssueCount } }")
+        snap["viewer"] = head["viewer"]
+        snap["organization"] = head["organization"]
         snap["users"] = page("users", "id name displayName email app active", False, 50)
         snap["teams"] = page(
             "teams",
-            "id key name description icon color cyclesEnabled triageEnabled "
-            "issueEstimationType archivedAt "
+            "id key name description icon color cyclesEnabled cycleStartDay cycleDuration "
+            "cycleCooldownTime upcomingCycleCount cycleLockToActive "
+            "cycleIssueAutoAssignStarted triageEnabled issueEstimationType archivedAt "
+            "autoCloseStateId defaultIssueState { id name } "
             "states { nodes { id name type color position description archivedAt "
             "issues(first: 1) { nodes { id } } } }",
-            False, 10)
-        snap["archivedTeams"] = page("teams", "id key name archivedAt", True, 25)
+            False, 10, on_problem=self.plan.problem)
+        snap["archivedTeams"] = page("teams", "id key name archivedAt", True, 25,
+                                     on_problem=self.plan.problem)
         snap["issueLabels"] = page(
             "issueLabels", "id name color description isGroup parent { id name } team { id key }",
             False, 100)
@@ -180,17 +208,32 @@ class Builder(object):
             False, 10)
         snap["documents"] = page(
             "documents", "id title project { id name } initiative { id name }", False, 25)
-        snap["issues"] = page(
+        issues = page(
             "issues",
-            "id identifier title description priority estimate sortOrder "
+            "id identifier title description priority estimate sortOrder trashed "
             "team { id key } state { id name } project { id name } "
             "projectMilestone { id name } delegate { id name } parent { id title } "
             "labels { nodes { id name } }",
             False, 25)
+        trashed = [i for i in issues if i.get("trashed")]
+        if trashed:
+            self.plan.note("%d issue(s) sit in the trash: ignored for matching, but they may "
+                           "still count against the Free-plan issue budget" % len(trashed))
+        snap["issues"] = [i for i in issues if not i.get("trashed")]
         self.snapshot = snap
+        self.reindex()
+        sys.stderr.write(
+            "  teams=%d issues=%d projects=%d initiatives=%d labels=%d docs=%d templates=%d\n"
+            % (len(snap["teams"]), len(snap["issues"]), len(snap["projects"]),
+               len(snap["initiatives"]), len(snap["issueLabels"]), len(snap["documents"]),
+               len(snap["templates"])))
 
+    def reindex(self):
+        """(Re)build every lookup over the snapshot. The teardown edits the snapshot
+        in place -- in dry runs too -- and calls this again afterwards."""
+        snap = self.snapshot
         self.by_team_key = {t["key"]: t for t in snap["teams"]}
-        self.label_by_name = {norm(l["name"]): l for l in snap["issueLabels"]}
+        self.label_by_key = {self.live_label_key(l): l for l in snap["issueLabels"]}
         self.project_label_by_name = {norm(l["name"]): l for l in snap["projectLabels"]}
         self.initiative_by_name = {norm(i["name"]): i for i in snap["initiatives"]}
         self.project_by_name = {norm(p["name"]): p for p in snap["projects"]}
@@ -203,134 +246,92 @@ class Builder(object):
         for i in snap["issues"]:
             tk = (i.get("team") or {}).get("key")
             self.issue_by_key[(tk, norm(i["title"]))] = i
-        self.app_user_by_name = {
-            norm(u["name"]): u for u in snap["users"] if u.get("app")
-        }
-        sys.stderr.write(
-            "  teams=%d issues=%d projects=%d initiatives=%d labels=%d docs=%d templates=%d\n"
-            % (len(snap["teams"]), len(snap["issues"]), len(snap["projects"]),
-               len(snap["initiatives"]), len(snap["issueLabels"]), len(snap["documents"]),
-               len(snap["templates"])))
+        self.app_user_by_name = {norm(u["name"]): u for u in snap["users"] if u.get("app")}
 
-    # ---------- step a: backup gate ----------
+    # ---------- label identity ----------
+
+    @staticmethod
+    def live_label_key(live):
+        parent = (live.get("parent") or {}).get("name")
+        return norm(label_key(live["name"], parent))
+
+    @staticmethod
+    def spec_label_key(spec_label):
+        return label_key(spec_label["name"], spec_label.get("group"))
+
+    def spec_label_keys(self):
+        return {norm(self.spec_label_key(l)) for l in self.spec.get("labels", [])}
+
+    def spec_group_pair(self, group):
+        """Two label references from one group -- what the probe pokes Linear with."""
+        members = [self.spec_label_key(l) for l in self.spec.get("labels", [])
+                   if norm(l.get("group") or "") == norm(group)]
+        return members[:2]
+
+    def resolve_label_id(self, reference, where):
+        """'group/child' first, then a bare child name if it is unambiguous."""
+        found = self.get_id("label", reference)
+        if found:
+            return found
+        if "/" not in reference:
+            tails = [key for key in self.ids
+                     if key.startswith("label:") and key.endswith("/" + reference)]
+            if len(tails) == 1:
+                return self.ids[tails[0]]
+            if len(tails) > 1:
+                self.plan.problem("%s references %r, which exists in %d groups (%s); write it as "
+                                  "group/child" % (where, reference, len(tails),
+                                                   ", ".join(sorted(t[6:] for t in tails))))
+                return None
+        self.plan.problem("%s references unknown label %r" % (where, reference))
+        return None
+
+    # ---------- gates ----------
+
+    def guard_workspace(self, org_arg):
+        live = linear_guard.check_workspace(self.snapshot.get("organization"), org_arg,
+                                            key_source())
+        sys.stderr.write("Workspace: %s (%s), key from %s\n"
+                         % (live["urlKey"], live["id"], key_source()))
 
     def check_backup(self, backup_path):
-        live_issues = len(self.snapshot["issues"])
-        if not os.path.exists(backup_path):
-            raise SystemExit("REFUSING TO RUN: backup file %s does not exist" % backup_path)
-        try:
-            with open(backup_path, "r", encoding="utf-8") as fh:
-                backup = json.load(fh)
-        except ValueError as exc:
-            raise SystemExit("REFUSING TO RUN: backup %s is not valid JSON (%s)"
-                             % (backup_path, exc))
-        backed_up = len(backup.get("issues") or [])
-        if backed_up < live_issues:
+        status = linear_guard.check_backup(
+            backup_path, self.snapshot, destructive=self.apply and self.teardown,
+            on_warning=self.plan.problem)
+        sys.stderr.write("%s\n" % status)
+
+    def check_issue_budget(self):
+        """The Free plan counts issues ever created, so rebuilds are finite."""
+        created = (self.snapshot.get("organization") or {}).get("createdIssueCount")
+        if created is None:
+            return
+        need = len(self.spec.get("issues", [])) + PROBE_ISSUE_ALLOWANCE
+        head = FREE_PLAN_ISSUE_CAP - created
+        message = ("Free-plan issue budget: %d created, %d of %d left, this build needs %d"
+                   % (created, head, FREE_PLAN_ISSUE_CAP, need))
+        self.plan.note(message)
+        sys.stderr.write("%s\n" % message)
+        if head >= need:
+            return
+        if self.apply and self.teardown and not self.allow_tight_budget:
             raise SystemExit(
-                "REFUSING TO RUN: backup holds %d issues but the workspace has %d -- "
-                "re-run backup_linear.py" % (backed_up, live_issues))
-        sys.stderr.write("Backup OK: %d issues archived vs %d live.\n" % (backed_up, live_issues))
+                "REFUSING TO RUN: %s. If deleting issues does not give the counter back, this "
+                "build strands partway through issueCreate. Prove it with --probe first, or "
+                "pass --allow-tight-budget." % message)
+        self.plan.problem("%s -- the build does not fit unless deleting issues frees the counter"
+                          % message)
 
-    # ---------- step b: teardown ----------
-
-    def run_teardown(self):
-        stale = [t for t in self.snapshot["archivedTeams"] if t.get("archivedAt")]
-        if stale:
-            self.plan.problem(
-                "archived team(s) %s still exist; teardown leaves archived teams alone, but they "
-                "may still count against the free-plan 2-team limit"
-                % ", ".join("%s (%s)" % (t["key"], t["name"]) for t in stale))
-        victims = [t for t in self.snapshot["teams"] if t["key"] not in self.spec_team_keys]
-        if not victims:
-            self.plan.add("skip", "teardown", "no obsolete teams found")
-            return
-        victim_ids = {t["id"] for t in victims}
-        victim_keys = sorted(t["key"] for t in victims)
-
-        issues = [i for i in self.snapshot["issues"]
-                  if (i.get("team") or {}).get("id") in victim_ids]
-        self.delete_issues(issues)
-
-        projects = [p for p in self.snapshot["projects"]
-                    if any(t["id"] in victim_ids for t in (p.get("teams") or {}).get("nodes", []))]
-        for project in projects:
-            self.mutate("project", "delete", project["name"],
-                        "mutation($id: String!) { projectDelete(id: $id) { success } }",
-                        {"id": project["id"]}, "projectDelete")
-
-        spec_initiative_names = {norm(i["name"]) for i in self.spec.get("initiatives", [])}
-        for initiative in self.snapshot["initiatives"]:
-            if norm(initiative["name"]) in spec_initiative_names:
-                continue
-            named = norm(initiative["name"]) == norm(TEARDOWN_INITIATIVE)
-            self.delete_initiative(
-                initiative,
-                detail=("the initiative named in the teardown brief" if named
-                        else "not in the spec"))
-
-        for team in victims:
-            self.mutate("team", "delete", "%s (%s)" % (team["key"], team["name"]),
-                        "mutation($id: String!) { teamDelete(id: $id) { success entityId } }",
-                        {"id": team["id"]}, "teamDelete",
-                        detail="archives the team and schedules cascading deletion")
-        if self.apply:
-            self.poll_team_gone(victim_keys)
-
-    def delete_issues(self, issues):
-        if not issues:
-            return
-        self.plan.add("delete", "issue", "%d issues of obsolete teams" % len(issues),
-                      "batched %d per request via aliased issueDelete" % ISSUE_DELETE_BATCH,
-                      weight=len(issues))
-        if not self.apply:
-            return
-        done = 0
-        for start in range(0, len(issues), ISSUE_DELETE_BATCH):
-            chunk = issues[start:start + ISSUE_DELETE_BATCH]
-            decls = ", ".join("$id%d: String!" % n for n in range(len(chunk)))
-            body = " ".join(
-                "d%d: issueDelete(id: $id%d) { success }" % (n, n) for n in range(len(chunk)))
-            variables = {"id%d" % n: issue["id"] for n, issue in enumerate(chunk)}
-            gql("mutation(%s) { %s }" % (decls, body), variables)
-            done += len(chunk)
-            sys.stderr.write("  deleted %d/%d issues\n" % (done, len(issues)))
-            sys.stderr.flush()
-
-    def delete_initiative(self, initiative, detail=""):
-        try:
-            self.mutate("initiative", "delete", initiative["name"],
-                        "mutation($id: String!) { initiativeDelete(id: $id) { success } }",
-                        {"id": initiative["id"]}, "initiativeDelete", detail=detail)
-        except LinearError as exc:
-            self.plan.problem("initiativeDelete failed for %r (%s); archiving instead"
-                              % (initiative["name"], exc))
-            self.mutate("initiative", "archive", initiative["name"],
-                        "mutation($id: String!) { initiativeArchive(id: $id) { success } }",
-                        {"id": initiative["id"]}, "initiativeArchive")
-
-    def poll_team_gone(self, keys):
-        deadline = time.time() + TEAM_DELETE_POLL_SECONDS
-        query = ("query { active: teams(first: 100) { nodes { key } } "
-                 "all: teams(first: 100, includeArchived: true) { nodes { key archivedAt } } }")
-        while True:
-            data = gql(query)
-            active = {t["key"] for t in data["active"]["nodes"]}
-            archived = {t["key"] for t in data["all"]["nodes"] if t.get("archivedAt")}
-            still = sorted(k for k in keys if k in active)
-            if not still:
-                sys.stderr.write(
-                    "  teamDelete confirmed: %s gone from active teams (archived listing still "
-                    "shows: %s)\n" % (", ".join(keys), ", ".join(sorted(archived & set(keys))) or "none"))
-                return True
-            if time.time() >= deadline:
+    def preflight(self):
+        """Resolve every live-side reference before the first mutation."""
+        for name in sorted({i["delegate"] for i in self.spec.get("issues", [])
+                            if i.get("delegate")}):
+            if norm(name) not in self.app_user_by_name:
                 self.plan.problem(
-                    "teamDelete: %s still listed as active after %ds; Linear deletes team data "
-                    "asynchronously, so the free-plan team slot may not be free yet"
-                    % (", ".join(still), TEAM_DELETE_POLL_SECONDS))
-                sys.stderr.write("  teamDelete NOT confirmed for %s after %ds\n"
-                                 % (", ".join(still), TEAM_DELETE_POLL_SECONDS))
-                return False
-            time.sleep(5)
+                    "no installed app user named %r -- %d issue(s) would land without a delegate "
+                    "(installed app users: %s)"
+                    % (name, sum(1 for i in self.spec["issues"] if i.get("delegate") == name),
+                       ", ".join(sorted(u["name"] for u in self.app_user_by_name.values()))
+                       or "none"))
 
     # ---------- step c: teams, states, settings ----------
 
@@ -357,11 +358,13 @@ class Builder(object):
                 self.put_id("team", key, team_id)
                 self.by_team_key[key] = self.fresh_team_states(spec_team, team_id)
             self.build_states(spec_team)
+            self.checkpoint()
 
     def fresh_team_states(self, spec_team, team_id):
         """States a just-created team has: read them back, or predict them in a dry run."""
         if self.apply:
-            data = gql("query($id: String!) { team(id: $id) { id key states { nodes "
+            data = gql("query($id: String!) { team(id: $id) { id key autoCloseStateId "
+                       "defaultIssueState { id name } states { nodes "
                        "{ id name type color position description archivedAt "
                        "issues(first: 1) { nodes { id } } } } } }", {"id": team_id})
             return data["team"]
@@ -369,7 +372,8 @@ class Builder(object):
         if not spec_team.get("triageEnabled"):
             predicted = [s for s in predicted if s["type"] != "triage"]
         for state in predicted:
-            state["id"] = self.placeholder("defaultState", "%s/%s" % (spec_team["key"], state["name"]))
+            state["id"] = self.placeholder("defaultState",
+                                           "%s/%s" % (spec_team["key"], state["name"]))
         return {"id": team_id, "key": spec_team["key"], "states": {"nodes": predicted}}
 
     def create_team(self, spec_team, wanted):
@@ -378,17 +382,23 @@ class Builder(object):
         payload = {k: v for k, v in payload.items() if v is not None}
         query = ("mutation($input: TeamCreateInput!) "
                  "{ teamCreate(input: $input) { success team { id key } } }")
+        # Recorded once, outside the retry loop: a plan-limit retry is the same
+        # intended operation, not another one.
+        self.plan.add("create", "team", spec_team["key"], spec_team.get("name", ""),
+                      query=query, variables={"input": payload})
+        if not self.apply:
+            return None
         for attempt in range(1, PLAN_LIMIT_RETRIES + 1):
             try:
-                return self.mutate(
-                    "team", "create", spec_team["key"], query, {"input": payload},
-                    "teamCreate.team", detail=spec_team.get("name", ""))
+                return self.execute(query, {"input": payload}, "teamCreate.team")
             except LinearError as exc:
                 if exc.matches("icon") and "icon" in payload:
                     self.plan.problem("team %s: icon %r rejected, creating without an icon"
                                       % (spec_team["key"], payload.pop("icon")))
                     continue
-                limit_hit = exc.matches("limit", "free plan", "upgrade", "maximum number of teams")
+                # Deliberately narrow: a plain 'rate limit' must not burn 8 x 15s here.
+                limit_hit = exc.matches("free plan", "upgrade", "maximum number of teams",
+                                        "team limit")
                 if limit_hit and attempt < PLAN_LIMIT_RETRIES:
                     sys.stderr.write("  team limit hit (attempt %d/%d): %s -- waiting %ds\n"
                                      % (attempt, PLAN_LIMIT_RETRIES, exc, PLAN_LIMIT_WAIT))
@@ -400,8 +410,8 @@ class Builder(object):
     def build_states(self, spec_team):
         key = spec_team["key"]
         team_id = self.get_id("team", key)
-        live_team = self.by_team_key.get(key)
-        live_states = [s for s in ((live_team or {}).get("states") or {}).get("nodes", [])
+        live_team = self.by_team_key.get(key) or {}
+        live_states = [s for s in (live_team.get("states") or {}).get("nodes", [])
                        if not s.get("archivedAt")]
         by_name = {norm(s["name"]): s for s in live_states}
         by_type = {}
@@ -417,22 +427,22 @@ class Builder(object):
             live = by_name.get(norm(name))
             if live is None and spec_state["type"] == "triage":
                 # `triage` is not creatable; Linear makes one when triageEnabled is on.
-                candidates = by_type.get("triage") or []
+                candidates = [s for s in by_type.get("triage") or [] if s["id"] not in matched]
                 live = candidates[0] if candidates else None
                 if live is None:
                     self.plan.problem(
-                        "team %s: spec wants a triage state %r but the team has none; it appears "
-                        "only after triageEnabled is on (teamCreate/teamUpdate above sets it, but "
-                        "a re-run is needed to rename it)" % (key, name))
+                        "team %s: the spec wants a triage state %r but the team has none; it "
+                        "appears only after triageEnabled is on (teamCreate/teamUpdate above sets "
+                        "it, but a re-run is needed to rename it)" % (key, name))
                     continue
             if live is not None:
                 matched.add(live["id"])
                 self.put_id("state", "%s/%s" % (key, name), live["id"])
                 if live["type"] != spec_state["type"]:
                     self.plan.problem(
-                        "team %s state %r is type %r but the spec wants %r; WorkflowStateUpdateInput "
-                        "cannot change type, so this state must be recreated by hand"
-                        % (key, name, live["type"], spec_state["type"]))
+                        "team %s state %r is type %r but the spec wants %r; "
+                        "WorkflowStateUpdateInput cannot change type, so this state has to be "
+                        "recreated by hand" % (key, name, live["type"], spec_state["type"]))
                 changes = self.diff_fields(live, wanted)
                 if changes:
                     self.mutate("state", "update", "%s/%s" % (key, name),
@@ -461,31 +471,69 @@ class Builder(object):
             self.put_id("state", "%s/%s" % (key, name),
                         node["id"] if node else self.placeholder("state", "%s/%s" % (key, name)))
 
+        self.archive_unused_states(spec_team, live_team, live_states, matched)
+
+    def archive_unused_states(self, spec_team, live_team, live_states, matched):
+        key = spec_team["key"]
+        doomed = []
         for state in live_states:
             if state["id"] in matched:
                 continue
-            has_issues = bool((state.get("issues") or {}).get("nodes"))
-            if has_issues:
+            if state["type"] in PROTECTED_STATE_TYPES:
+                self.plan.add("keep", "state", "%s/%s" % (key, state["name"]),
+                              "type %s is managed by Linear and cannot be archived"
+                              % state["type"])
+                continue
+            if (state.get("issues") or {}).get("nodes"):
                 self.plan.add("keep", "state", "%s/%s" % (key, state["name"]),
                               "not in spec but still holds issues -- left alone")
                 continue
+            doomed.append(state)
+        if not doomed:
+            return
+        self.repoint_team_states(spec_team, live_team, {s["id"] for s in doomed})
+        for state in doomed:
             self.mutate("state", "archive", "%s/%s" % (key, state["name"]),
                         "mutation($id: String!) { workflowStateArchive(id: $id) { success } }",
                         {"id": state["id"]}, "workflowStateArchive",
-                        detail="default state not in spec, no issues")
+                        detail="default state not in the spec, holds no issues", tolerate=True)
+
+    def repoint_team_states(self, spec_team, live_team, doomed_ids):
+        """A state the team points at (default or auto-close) refuses to archive,
+        so both pointers move to their spec states first."""
+        key = spec_team["key"]
+        fixes = {}
+        pointers = (("defaultIssueStateId", (live_team.get("defaultIssueState") or {}).get("id"),
+                     spec_team.get("defaultState")),
+                    ("autoCloseStateId", live_team.get("autoCloseStateId"),
+                     spec_team.get("autoCloseState")))
+        for field, current, wanted_name in pointers:
+            if not wanted_name:
+                continue
+            target = self.get_id("state", "%s/%s" % (key, wanted_name))
+            if not target:
+                self.plan.problem("team %s wants %s = %r but that state has no id"
+                                  % (key, field, wanted_name))
+                continue
+            if current != target:
+                fixes[field] = target
+        if not fixes:
+            return
+        self.mutate("team", "update", key,
+                    "mutation($id: String!, $input: TeamUpdateInput!) "
+                    "{ teamUpdate(id: $id, input: $input) { success team { id } } }",
+                    {"id": self.get_id("team", key), "input": fixes}, "teamUpdate.team",
+                    detail="%s -- must happen before the old states are archived"
+                           % ", ".join(sorted(fixes)))
 
     # ---------- step d1: labels ----------
 
     def build_labels(self):
         specs = self.spec.get("labels", [])
-        group_names = {norm(l["group"]) for l in specs if l.get("group")}
-        parents = [l for l in specs if norm(l["name"]) in group_names]
-        children = [l for l in specs if norm(l["name"]) not in group_names]
-
-        for spec_label in parents:
-            self.sync_issue_label(spec_label, is_group=True)
-        for spec_label in children:
-            self.sync_issue_label(spec_label, is_group=False)
+        for spec_label in [l for l in specs if l.get("isGroup")]:
+            self.sync_issue_label(spec_label)
+        for spec_label in [l for l in specs if not l.get("isGroup")]:
+            self.sync_issue_label(spec_label)
 
         wanted_project_labels = []
         for project in self.spec.get("projects", []):
@@ -494,18 +542,21 @@ class Builder(object):
                     wanted_project_labels.append(name)
         for name in wanted_project_labels:
             self.sync_project_label(name)
+        self.checkpoint()
 
-    def sync_issue_label(self, spec_label, is_group):
+    def sync_issue_label(self, spec_label):
         name = spec_label["name"]
+        key = self.spec_label_key(spec_label)
+        is_group = bool(spec_label.get("isGroup"))
         parent_id = None
         if spec_label.get("group"):
             parent_id = self.get_id("label", spec_label["group"])
             if parent_id is None:
                 self.plan.problem("label %r references unknown group %r"
-                                  % (name, spec_label["group"]))
-        live = self.label_by_name.get(norm(name))
+                                  % (key, spec_label["group"]))
+        live = self.label_by_key.get(norm(key))
         if live:
-            self.put_id("label", name, live["id"])
+            self.put_id("label", key, live["id"])
             wanted = {"name": name, "color": spec_label.get("color"),
                       "description": spec_label.get("description"), "isGroup": is_group}
             changes = self.diff_fields(live, wanted)
@@ -513,14 +564,14 @@ class Builder(object):
             if parent_id and not self.is_placeholder(parent_id) and live_parent != parent_id:
                 changes["parentId"] = parent_id
             if changes:
-                self.mutate("label", "update", name,
+                self.mutate("label", "update", key,
                             "mutation($id: String!, $input: IssueLabelUpdateInput!) "
                             "{ issueLabelUpdate(id: $id, input: $input) "
                             "{ success issueLabel { id } } }",
                             {"id": live["id"], "input": changes}, "issueLabelUpdate.issueLabel",
                             detail=", ".join(sorted(changes)))
             else:
-                self.plan.add("ok", "label", name, "already matches spec")
+                self.plan.add("ok", "label", key, "already matches spec")
             return
 
         payload = {"name": name, "color": spec_label.get("color"),
@@ -532,12 +583,12 @@ class Builder(object):
         if spec_label.get("teamKey"):
             payload["teamId"] = self.get_id("team", spec_label["teamKey"])
         payload = {k: v for k, v in payload.items() if v is not None}
-        node = self.mutate("label", "create", name,
+        node = self.mutate("label", "create", key,
                            "mutation($input: IssueLabelCreateInput!) "
                            "{ issueLabelCreate(input: $input) { success issueLabel { id } } }",
                            {"input": payload}, "issueLabelCreate.issueLabel",
                            detail=("group" if is_group else (spec_label.get("group") or "flat")))
-        self.put_id("label", name, node["id"] if node else self.placeholder("label", name))
+        self.put_id("label", key, node["id"] if node else self.placeholder("label", key))
 
     def sync_project_label(self, name):
         live = self.project_label_by_name.get(norm(name))
@@ -582,6 +633,7 @@ class Builder(object):
                                {"input": payload}, "initiativeCreate.initiative")
             self.put_id("initiative", name,
                         node["id"] if node else self.placeholder("initiative", name))
+        self.checkpoint()
 
     # ---------- step d3: projects, milestones, initiative links ----------
 
@@ -639,6 +691,7 @@ class Builder(object):
 
             self.build_milestones(spec_project, project_id, live)
             self.link_initiative(spec_project, project_id, live)
+            self.checkpoint()
 
     def build_milestones(self, spec_project, project_id, live):
         live_by_name = {}
@@ -698,13 +751,19 @@ class Builder(object):
 
     # ---------- step d4: templates ----------
 
-    def template_data(self, spec_template):
+    def template_data(self, spec_template, with_labels=True):
+        """`with_labels=False` is for the probe, which runs before the labels exist."""
         defaults = spec_template.get("defaults") or {}
         body = spec_template.get("body") or ""
         kind = spec_template["type"]
         if kind == "issue":
-            data = {"title": spec_template["name"], "description": body}
-            label_ids = [self.get_id("label", n) for n in defaults.get("labels") or []]
+            data = {"description": body}
+            # No title unless the spec asks for one: otherwise every issue made
+            # from the Bug template starts out titled "Bug".
+            if defaults.get("title"):
+                data["title"] = defaults["title"]
+            label_ids = [self.resolve_label_id(n, "template %r" % spec_template["name"])
+                         for n in defaults.get("labels") or []] if with_labels else []
             label_ids = [l for l in label_ids if l]
             if label_ids:
                 data["labelIds"] = label_ids
@@ -739,15 +798,19 @@ class Builder(object):
                 changes = {}
                 if (live.get("description") or "") != (spec_template.get("description") or ""):
                     changes["description"] = spec_template.get("description") or ""
-                if live.get("templateData") != data:
-                    changes["templateData"] = data
+                # templateData is an opaque blob that Linear normalises and adds
+                # keys to, so compare only the keys the spec owns and merge the
+                # server's own keys back in instead of wiping them.
+                live_data = live.get("templateData") or {}
+                if any(live_data.get(k) != v for k, v in data.items()):
+                    changes["templateData"] = dict(live_data, **data)
                 if changes:
                     self.mutate("template", "update", label,
                                 "mutation($id: String!, $input: TemplateUpdateInput!) "
                                 "{ templateUpdate(id: $id, input: $input) "
                                 "{ success template { id } } }",
                                 {"id": live["id"], "input": changes}, "templateUpdate.template",
-                                detail=", ".join(sorted(changes)))
+                                detail=", ".join(sorted(changes)), tolerate=True)
                 else:
                     self.plan.add("ok", "template", label, "already matches spec")
                 continue
@@ -761,9 +824,11 @@ class Builder(object):
                                "mutation($input: TemplateCreateInput!) "
                                "{ templateCreate(input: $input) { success template { id } } }",
                                {"input": payload}, "templateCreate.template",
-                               detail="templateData keys: " + ",".join(sorted(data)))
+                               detail="templateData keys: " + ",".join(sorted(data)),
+                               tolerate=True)
             self.put_id("template", label,
                         node["id"] if node else self.placeholder("template", label))
+        self.checkpoint()
 
     # ---------- step d5: documents ----------
 
@@ -778,7 +843,7 @@ class Builder(object):
             elif kind == "initiative":
                 parent_field, parent_id = "initiativeId", self.get_id("initiative", target)
             if not parent_id:
-                self.plan.problem("document %r has unresolvable scope %r" % (title, scope))
+                self.plan.problem("document %r has an unresolvable scope %r" % (title, scope))
                 continue
 
             live = self.document_by_title.get(norm(title))
@@ -791,9 +856,11 @@ class Builder(object):
             node = self.mutate("document", "create", title,
                                "mutation($input: DocumentCreateInput!) "
                                "{ documentCreate(input: $input) { success document { id } } }",
-                               {"input": payload}, "documentCreate.document", detail=scope)
+                               {"input": payload}, "documentCreate.document", detail=scope,
+                               tolerate=True)
             self.put_id("document", title,
                         node["id"] if node else self.placeholder("document", title))
+        self.checkpoint()
 
     # ---------- step d6: issues ----------
 
@@ -801,13 +868,7 @@ class Builder(object):
         if not name:
             return None
         user = self.app_user_by_name.get(norm(name))
-        if not user:
-            self.plan.problem("no installed app user named %r -- delegate left empty "
-                              "(installed app users: %s)"
-                              % (name, ", ".join(sorted(u["name"] for u
-                                                        in self.app_user_by_name.values())) or "none"))
-            return None
-        return user["id"]
+        return user["id"] if user else None
 
     def state_type(self, team_key, state_name):
         for spec_team in self.spec.get("teams", []):
@@ -820,28 +881,33 @@ class Builder(object):
 
     def issue_payload(self, spec_issue):
         team_key = spec_issue["teamKey"]
-        payload = {"teamId": self.get_id("team", team_key), "title": spec_issue["title"]}
+        title = spec_issue["title"]
+        payload = {"teamId": self.get_id("team", team_key), "title": title}
         if spec_issue.get("description"):
             payload["description"] = spec_issue["description"]
         state_id = self.get_id("state", "%s/%s" % (team_key, spec_issue["state"]))
-        if state_id:
+        triage = self.state_type(team_key, spec_issue["state"]) == "triage"
+        if state_id and triage and self.probe_results.get("triageStateAccepted") is False:
+            self.plan.problem("issue %r drops its stateId: the probe showed issueCreate does not "
+                              "keep an issue in the triage state %s/%s"
+                              % (title, team_key, spec_issue["state"]))
+        elif state_id:
             payload["stateId"] = state_id
-            if self.state_type(team_key, spec_issue["state"]) == "triage":
+            if triage and "triageStateAccepted" not in self.probe_results and not self.probe:
                 self.plan.problem(
-                    "issues are seeded straight into the triage state %s/%s; Linear normally "
-                    "puts issues there only through triage intake, so confirm issueCreate "
-                    "accepts that stateId before the real run"
+                    "issues are seeded straight into the triage state %s/%s; run --probe as well, "
+                    "so that issueCreate is known to accept that stateId"
                     % (team_key, spec_issue["state"]))
         else:
             self.plan.problem("issue %r wants state %r on team %s, which the spec does not define"
-                              % (spec_issue["title"], spec_issue["state"], team_key))
+                              % (title, spec_issue["state"], team_key))
         if spec_issue.get("project"):
             project_id = self.get_id("project", spec_issue["project"])
             if project_id:
                 payload["projectId"] = project_id
             else:
                 self.plan.problem("issue %r references unknown project %r"
-                                  % (spec_issue["title"], spec_issue["project"]))
+                                  % (title, spec_issue["project"]))
         if spec_issue.get("milestone") and spec_issue.get("project"):
             key = "%s / %s" % (spec_issue["project"], spec_issue["milestone"])
             milestone_id = self.get_id("milestone", key)
@@ -849,12 +915,9 @@ class Builder(object):
                 payload["projectMilestoneId"] = milestone_id
             else:
                 self.plan.problem("issue %r references unknown milestone %r"
-                                  % (spec_issue["title"], spec_issue["milestone"]))
-        label_ids = [self.get_id("label", n) for n in spec_issue.get("labels") or []]
-        missing = [n for n, i in zip(spec_issue.get("labels") or [], label_ids) if not i]
-        for name in missing:
-            self.plan.problem("issue %r references unknown label %r"
-                              % (spec_issue["title"], name))
+                                  % (title, spec_issue["milestone"]))
+        label_ids = [self.resolve_label_id(n, "issue %r" % title)
+                     for n in spec_issue.get("labels") or []]
         label_ids = [l for l in label_ids if l]
         if label_ids:
             payload["labelIds"] = label_ids
@@ -912,8 +975,10 @@ class Builder(object):
                                detail="%s | %s" % (spec_issue.get("state"),
                                                    spec_issue.get("project") or "no project"))
             self.put_id("issue", key, node["id"] if node else self.placeholder("issue", key))
+        self.checkpoint()
+        self.link_sub_issues(spec_issues)
 
-        # second pass: sub-issues, matched by parent title inside the same team
+    def link_sub_issues(self, spec_issues):
         for spec_issue in spec_issues:
             parent_title = spec_issue.get("parent")
             if not parent_title:
@@ -921,9 +986,10 @@ class Builder(object):
             team_key = spec_issue["teamKey"]
             child_id = self.get_id("issue", "%s/%s" % (team_key, spec_issue["title"]))
             parent_id = self.get_id("issue", "%s/%s" % (team_key, parent_title))
-            if not parent_id:
-                self.plan.problem("issue %r references unknown parent %r"
-                                  % (spec_issue["title"], parent_title))
+            if not child_id or not parent_id:
+                self.plan.problem("cannot link %r to parent %r: %s has no id"
+                                  % (spec_issue["title"], parent_title,
+                                     "the child" if not child_id else "the parent"))
                 continue
             live = self.issue_by_key.get((team_key, norm(spec_issue["title"])))
             if live and (live.get("parent") or {}).get("id") == parent_id:
@@ -936,16 +1002,25 @@ class Builder(object):
 
     # ---------- orchestration ----------
 
-    def run(self, backup_path, backup_required):
+    def run(self, backup_path, backup_required, org_arg=None):
         self.load_snapshot()
+        self.guard_workspace(org_arg)
+        self.preflight()
         if self.apply or backup_required:
             self.check_backup(backup_path)
+        self.check_issue_budget()
+
+        prober = Probe(self) if self.probe else None
+        if prober:
+            prober.before_teardown(LEGACY_TEAM_ID)
         if self.teardown:
-            self.run_teardown()
+            Teardown(self).run()
             if self.apply:
                 self.load_snapshot()
         self.build_teams()
         self.build_labels()
+        if prober:
+            prober.after_labels(self.spec_team_keys[0])
         self.build_initiatives()
         self.build_projects()
         self.build_templates()
@@ -970,142 +1045,25 @@ class Builder(object):
 INPUT_TYPE_RE = "$input: "
 
 
-def validate_inputs(plan):
-    """Check every planned `input:` payload against the live GraphQL input type.
-
-    Read-only: it only runs introspection, never the mutation itself.
-    """
-    cache = {}
-    problems = []
-    checked = 0
-    for entry in plan.entries:
-        query, variables = entry.get("query"), entry.get("variables")
-        if not query or not variables or "input" not in variables:
-            continue
-        marker = query.find(INPUT_TYPE_RE)
-        if marker < 0:
-            continue
-        rest = query[marker + len(INPUT_TYPE_RE):]
-        type_name = ""
-        for char in rest:
-            if not (char.isalnum() or char == "_"):
-                break
-            type_name += char
-        if not type_name:
-            continue
-        if type_name not in cache:
-            data = gql("query($n: String!) { __type(name: $n) { inputFields { name "
-                       "type { kind name ofType { kind name enumValues { name } } "
-                       "enumValues { name } } } } }", {"n": type_name})
-            info = data.get("__type")
-            if not info:
-                problems.append("input type %s does not exist" % type_name)
-                cache[type_name] = None
-                continue
-            cache[type_name] = {f["name"]: f["type"] for f in info["inputFields"]}
-        fields = cache[type_name]
-        if fields is None:
-            continue
-        checked += 1
-        payload = variables["input"]
-        if not isinstance(payload, dict):
-            continue
-        for name, field_type in fields.items():
-            if field_type.get("kind") == "NON_NULL" and name not in payload:
-                problems.append("%s %s %r: %s requires %r but the payload omits it"
-                                % (entry["op"], entry["kind"], entry["name"], type_name, name))
-        for key, value in payload.items():
-            if key not in fields:
-                problems.append("%s %s %r: %s has no field %r"
-                                % (entry["op"], entry["kind"], entry["name"], type_name, key))
-                continue
-            inner = fields[key]
-            if inner.get("kind") == "NON_NULL":
-                inner = inner.get("ofType") or {}
-            allowed = inner.get("enumValues")
-            if allowed and isinstance(value, str):
-                names = {v["name"] for v in allowed}
-                if value not in names:
-                    problems.append("%s %s %r: %s.%s = %r is not one of %s"
-                                    % (entry["op"], entry["kind"], entry["name"], type_name,
-                                       key, value, ", ".join(sorted(names))))
-    return checked, sorted(set(problems)), sorted(k for k, v in cache.items() if v)
-
-
-def verify(spec):
-    """Re-read the workspace and report what the spec wants but does not have."""
-    builder = Builder(spec, apply_changes=False, teardown=False, verbose=False)
-    builder.load_snapshot()
-    rows = []
-
-    def compare(kind, wanted_names, live_names):
-        wanted = {norm(n) for n in wanted_names}
-        live = {norm(n) for n in live_names}
-        missing = sorted(n for n in wanted_names if norm(n) not in live)
-        extra = sorted(n for n in live_names if norm(n) not in wanted)
-        rows.append((kind, len(wanted), len(live), missing, extra))
-
-    compare("teams", [t["key"] for t in spec["teams"]],
-            [t["key"] for t in builder.snapshot["teams"]])
-    for spec_team in spec["teams"]:
-        live_team = builder.by_team_key.get(spec_team["key"])
-        live_states = [] if not live_team else [
-            s["name"] for s in (live_team.get("states") or {}).get("nodes", [])
-            if not s.get("archivedAt")]
-        compare("states/%s" % spec_team["key"], [s["name"] for s in spec_team["states"]],
-                live_states)
-    compare("labels", [l["name"] for l in spec["labels"]],
-            [l["name"] for l in builder.snapshot["issueLabels"]])
-    wanted_project_labels = sorted({n for p in spec["projects"] for n in p.get("labels") or []})
-    compare("projectLabels", wanted_project_labels,
-            [l["name"] for l in builder.snapshot["projectLabels"]])
-    compare("initiatives", [i["name"] for i in spec["initiatives"]],
-            [i["name"] for i in builder.snapshot["initiatives"]])
-    compare("projects", [p["name"] for p in spec["projects"]],
-            [p["name"] for p in builder.snapshot["projects"]])
-    compare("milestones", ["%s / %s" % (p["name"], m["name"])
-                           for p in spec["projects"] for m in p.get("milestones") or []],
-            ["%s / %s" % (p["name"], m["name"]) for p in builder.snapshot["projects"]
-             for m in (p.get("projectMilestones") or {}).get("nodes", [])])
-    compare("templates", ["%s [%s]" % (t["name"], t["type"]) for t in spec["templates"]],
-            ["%s [%s]" % (t["name"], t["type"]) for t in builder.snapshot["templates"]])
-    compare("documents", [d["title"] for d in spec["documents"]],
-            [d["title"] for d in builder.snapshot["documents"]])
-    compare("issues", ["%s/%s" % (i["teamKey"], i["title"]) for i in spec["issues"]],
-            ["%s/%s" % ((i.get("team") or {}).get("key"), i["title"])
-             for i in builder.snapshot["issues"]])
-
-    print("VERIFY -- spec vs live workspace")
-    print("  %-18s %6s %6s %8s %6s" % ("KIND", "SPEC", "LIVE", "MISSING", "EXTRA"))
-    ok = True
-    for kind, wanted, live, missing, extra in rows:
-        print("  %-18s %6d %6d %8d %6d" % (kind, wanted, live, len(missing), len(extra)))
-        if missing:
-            ok = False
-            for name in missing[:10]:
-                print("      missing: %s" % name)
-            if len(missing) > 10:
-                print("      ... and %d more" % (len(missing) - 10))
-        for name in extra[:5]:
-            print("      extra:   %s" % name)
-        if len(extra) > 5:
-            print("      ... and %d more extra" % (len(extra) - 5))
-    print("VERDICT: %s" % ("spec fully applied" if ok else "spec NOT fully applied"))
-    return 0 if ok else 1
-
-
 def main():
     parser = argparse.ArgumentParser(description="Apply linear-spec.json to Linear")
     parser.add_argument("--spec", default=SPEC_PATH)
-    parser.add_argument("--backup", default=BACKUP_PATH)
+    parser.add_argument("--backup", default=None,
+                        help="default: the newest linear/backup-*.json")
     parser.add_argument("--idmap", default=IDMAP_PATH)
+    parser.add_argument("--org", default=linear_guard.EXPECTED_ORG["urlKey"],
+                        help="urlKey the API key has to resolve to")
     parser.add_argument("--dry-run", action="store_true",
                         help="print the plan without mutating (the default)")
     parser.add_argument("--apply", action="store_true", help="actually mutate the workspace")
     parser.add_argument("--teardown", action="store_true",
-                        help="delete issues, projects, initiatives and teams not in the spec")
+                        help="empty the old workspace and rename its team into the spec's")
+    parser.add_argument("--probe", action="store_true",
+                        help="prove the unknown API shapes with throwaway records first")
     parser.add_argument("--backup-required", action="store_true",
-                        help="hard-fail unless the backup exists and covers every live issue")
+                        help="hard-fail unless a complete, covering backup exists")
+    parser.add_argument("--allow-tight-budget", action="store_true",
+                        help="run even when the Free-plan issue budget looks too small")
     parser.add_argument("--verify", action="store_true",
                         help="re-read the workspace and diff it against the spec")
     parser.add_argument("--quiet", action="store_true", help="summary counts only")
@@ -1115,38 +1073,57 @@ def main():
 
     with open(args.spec, "r", encoding="utf-8") as fh:
         spec = json.load(fh)
+    linear_check.validate_spec(spec)
 
     if args.verify:
-        return verify(spec)
+        return linear_check.verify(
+            spec, Builder(spec, apply_changes=False, teardown=False,
+                          verbose=False), args.org)
 
     if args.apply and args.dry_run:
         parser.error("--apply and --dry-run are mutually exclusive")
 
+    backup_path = args.backup or linear_guard.newest_backup(BACKUP_DIR)
     builder = Builder(spec, apply_changes=args.apply, teardown=args.teardown,
-                      verbose=not args.quiet)
+                      verbose=not args.quiet, probe=args.probe, idmap_path=args.idmap,
+                      allow_tight_budget=args.allow_tight_budget)
     try:
-        builder.run(args.backup, args.backup_required)
+        builder.run(backup_path, args.backup_required, args.org)
     except LinearError as exc:
         sys.stderr.write("\nABORTED on a Linear error: %s\n" % exc)
         if exc.variables:
             sys.stderr.write(json.dumps(exc.variables, ensure_ascii=False)[:1500] + "\n")
         print("\nPLAN UP TO THE FAILURE")
         print(builder.plan.render(verbose=not args.quiet))
+        if args.apply:
+            print("id map written to %s: %s" % (args.idmap, builder.write_idmap(args.idmap)))
         return 1
 
     header = "APPLIED" if args.apply else "DRY RUN -- no mutations were sent"
     print("\n%s" % header)
     print(builder.plan.render(verbose=not args.quiet))
-    print("\nAPI: %d requests, %d retries" % (stats()["requests"], stats()["retries"]))
+    print("\nAPI: %d requests, %d retries, %s requests left this hour"
+          % (stats()["requests"], stats()["retries"],
+             last_headers().get("x-ratelimit-requests-remaining", "?")))
 
     if args.validate:
-        checked, issues, types = validate_inputs(builder.plan)
+        checked, issues, types = linear_check.validate_inputs(builder.plan)
         print("\nINPUT VALIDATION: %d payloads checked against %d live input types (%s)"
               % (checked, len(types), ", ".join(types)))
         for issue in issues:
             builder.plan.problem(issue)
         if not issues:
             print("  every payload key exists on its input type")
+
+    if builder.probe_results:
+        print("\nPROBE RESULTS")
+        for key, value in sorted(builder.probe_results.items()):
+            print("  %-26s %s" % (key, value))
+
+    if builder.plan.notes:
+        print("\nNOTES (%d)" % len(builder.plan.notes))
+        for note in builder.plan.notes:
+            print("  - %s" % note)
 
     if builder.plan.problems:
         print("\nPROBLEMS (%d)" % len(builder.plan.problems))

@@ -1,5 +1,7 @@
 # Linear backups contain the previous workspace's issues (not for a public repo)
 linear/backup-*.json
+# id map of the built workspace: ids, no secrets, but repo noise
+linear/idmap.json
 # local state
 .DS_Store
 __pycache__/

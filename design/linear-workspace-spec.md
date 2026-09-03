@@ -68,7 +68,7 @@ Eén issue per lead, per engagement en per klantrelatie, dat de hele reis aflegt
 | `triageEnabled` | `true` | De triage-inbox is de voordeur van het bureau |
 | `requirePriorityToLeaveTriage` | `false` | De Account-rol zet zelf prioriteit; een harde eis blokkeert de lus |
 | `cyclesEnabled` | `false` | Een klantreis past niet in sprints en zou de kolommen vervuilen |
-| `issueEstimationType` | `tShirt` | Eén schaal in de hele werkplaats (2.3) |
+| `issueEstimationType` | `linear` | Eén schaal in de hele werkplaats (2.3) |
 | `issueEstimationAllowZero` | `false` | Geen ongeschat werk |
 | `issueEstimationExtended` | `false` | XS tot XL is genoeg; XL betekent opknippen |
 | `defaultIssueEstimate` | `2` (= S) | |
@@ -111,7 +111,7 @@ Al het uitvoerende werk van alle disciplines, voor alle klanten, plus de machine
 | `triageEnabled` | `false` | Zie 1.3; "Binnen" is een gewone backlog-status |
 | `cyclesEnabled` | `true`, `cycleDuration: 2` weken, `cycleStartDay: 1`, `upcomingCycleCount: 2`, `cycleCooldownTime: 0`, `cycleLockToActive: false` | De sprint is een WIP-limiet op de poortcapaciteit van één mens |
 | `cycleIssueAutoAssignStarted` | `true` | Werk dat begint zonder cyclus rolt vanzelf de actieve cyclus in |
-| `issueEstimationType` | `tShirt` | Dezelfde schaal als KR; geen vertaaltabel in de kostenrapportage |
+| `issueEstimationType` | `linear` | Dezelfde schaal als KR; geen vertaaltabel in de kostenrapportage |
 | `defaultIssueEstimate` | `2` (= S) | |
 | `initiativesEnabled` | `true` | |
 | `autoArchivePeriod` | uit | Archiveren geeft geen issuebudget terug en verstopt bewijs |
@@ -135,7 +135,7 @@ Al het uitvoerende werk van alle disciplines, voor alle klanten, plus de machine
 
 ### 2.3 Eén schattingsschaal die drie dingen doet
 
-`tShirt` op beide teams. De schaal is bewust overladen: hij is tegelijk omvang, verwachte doorlooptijd en autonomiegrens. Linear kent geen eigen velden, dus dit is het enige native numerieke veld dat we hebben. Er is **geen kostenplafond**: de eurobedragen zijn verwachtingswaarden voor het kostenboek, geen stopgrens.
+`linear` op beide teams: de API-waarden 1 tot en met 5 komen er ongewijzigd in en uit, waar `tShirt` op 1-2-3-5-8 zou afronden. De schaal is bewust overladen: hij is tegelijk omvang, verwachte doorlooptijd en autonomiegrens. Linear kent geen eigen velden, dus dit is het enige native numerieke veld dat we hebben. Er is **geen kostenplafond**: de eurobedragen zijn verwachtingswaarden voor het kostenboek, geen stopgrens.
 
 | Estimate | API-waarde | Wandkloktijd agent | Verwachte modelkosten | Richtprijs klant | Autonomie |
 |---|---|---|---|---|---|
@@ -191,9 +191,11 @@ Het soort bepaalt welk sjabloon geldt en welk rolcontract Spil kiest.
 | `risico/laag` | Standaard. XS mag zonder kruisreview. |
 | `risico/midden` | Kruisreview verplicht door een ander modelfamilie. |
 | `risico/hoog` | Twee reviewers; het akkoordtoken moet luiden `AKKOORD RISICO-GEZIEN`; Poort 1 is niet over te slaan. |
-| `risico/klantdata` | Alleen testdata. Geen echte persoonsgegevens, ook niet fictief-realistische die naar een echte inbox gaan. |
-| `risico/publiek` | Het resultaat komt publiek online: menselijke eindredactie met naam en tijdstip is verplicht, Poort 2 is niet over te slaan. |
-| `risico/juridisch` | Spil voert niet uit maar levert een concept plus een vraag; compliance-controle door de Strateeg-rol verplicht. |
+| `risico-klantdata` | Alleen testdata. Geen echte persoonsgegevens, ook niet fictief-realistische die naar een echte inbox gaan. |
+| `risico-publiek` | Het resultaat komt publiek online: menselijke eindredactie met naam en tijdstip is verplicht, Poort 2 is niet over te slaan. |
+| `risico-juridisch` | Spil voert niet uit maar levert een concept plus een vraag; compliance-controle door de Strateeg-rol verplicht. |
+
+De groep `risico` bevat alleen de drie zwaartegraden; die zijn onderling uitsluitend. `risico-klantdata`, `risico-publiek` en `risico-juridisch` zijn losse vlaggen buiten de groep, want een issue kan tegelijk hoog én klantdata zijn en Linear laat binnen een groep maar één label toe.
 
 ### 3.6 `agent` — `#6E56CF` (modelroutering)
 `agent/fable` · `agent/opus` · `agent/sonnet` · `agent/codex` · `agent/cursor` · `agent/mens`
@@ -220,7 +222,8 @@ Leeg laten is normaal: het rolcontract bepaalt het model. Een expliciet label wi
 | `bewijs-ontbreekt` | `#EB5757` | QA | Een DoD-punt is afgevinkt zonder verifieerbaar bewijs. Blokkeert Klaar. |
 | `ai-verklaard` | `#4CB782` | Redacteur | De publieke uiting draagt de AI-vermelding. |
 | `geënsceneerd` | `#B59AFF` | mens | **Dit stap is voor de demo geregisseerd.** Er is precies één issue in de hele werkplaats dat dit label draagt (7.9). |
-| `ops/opruimen` | `#95A2B3` | Finops | Mag weg bij de volgende budgetronde, ná export. |
+| `risico-klantdata` · `risico-publiek` · `risico-juridisch` | `#F2994A` | Spil | De drie risicovlaggen uit 3.5; stapelen met een zwaartegraad uit de groep `risico`. |
+| `opruimen` | `#95A2B3` | Finops | Mag weg bij de volgende budgetronde, ná export. |
 
 ---
 
@@ -518,7 +521,7 @@ publiek: false
 
 ### 5.7 `Contentstuk` — WV
 
-Preset: labels `soort/contentstuk`, `dienst/content`, `risico/publiek`; estimate S.
+Preset: labels `soort/contentstuk`, `dienst/content`, `risico-publiek`; estimate S.
 
 ````markdown
 ## Opdracht
@@ -559,7 +562,7 @@ eindredacteur:
 
 ### 5.8 `Campagne of kalender` — WV
 
-Preset: labels `soort/campagne` of `soort/socialkalender`, `dienst/ads` of `dienst/social`, `risico/publiek`; estimate M.
+Preset: labels `soort/campagne` of `soort/socialkalender`, `dienst/ads` of `dienst/social`, `risico-publiek`; estimate M.
 
 ````markdown
 ## Doel
@@ -731,7 +734,7 @@ issue_quotum_kickoff: 12
 
 ## Wat altijd langs Poort 1 moet
 - alles met een nieuw datamodel, een nieuwe integratie of een nieuwe afhankelijkheid
-- alles met `risico/hoog`, `risico/publiek` of `risico/juridisch`
+- alles met `risico/hoog`, `risico-publiek` of `risico-juridisch`
 - alles boven omvang S
 
 ## Mijlpalen
@@ -1109,7 +1112,7 @@ Poort 1 mag worden overgeslagen als **alle** punten waar zijn; Spil controleert 
 - Het issue hoort bij een project waarvan de projectbeschrijving dit `soort/*` en `dienst/*` letterlijk in "wat vooraf akkoord is" noemt.
 - Dat project is aangemaakt na een Poort 1 die door een mens is gepasseerd.
 - De schatting is XS of S.
-- Er staat geen `risico/hoog`, `risico/publiek` of `risico/juridisch`.
+- Er staat geen `risico/hoog`, `risico-publiek` of `risico-juridisch`.
 - Het issue voegt geen nieuwe afhankelijkheid, geen nieuw datamodel en geen nieuwe integratie toe.
 
 Bij een pass zet Spil `poort/vooraf-akkoord` met een comment dat naar de werkafspraak verwijst.
@@ -1347,7 +1350,7 @@ De volgorde is dwingend; twee stappen zijn een eenrichtingsdeur.
 | 2 | Exporteer de titels van de legacy-issues, verwijder daarna de rest | GraphQL | MCP kan geen issues verwijderen; exporteren gaat altijd vóór verwijderen |
 | 3 | Nodig `spil@raderwerk.github.io (GitHub Pages; voorlopig geen eigen domein)` uit, maak een API-sleutel op dat account | UI | Vanaf hier is elke schrijfactie van de machine herkenbaar |
 | 4 | `organizationUpdate`: naam en urlKey naar Raderwerk | GraphQL | Doe dit vóór er links gedeeld worden |
-| 5 | `teamUpdate` op FC: naam Werkvloer, key WV, cycles aan, tShirt, triage uit | GraphQL | Lost het teamplafond op zonder op `teamDelete` te vertrouwen |
+| 5 | `teamUpdate` op FC: naam Werkvloer, key WV, cycles aan, `linear`-schaal, triage uit | GraphQL | Lost het teamplafond op zonder op `teamDelete` te vertrouwen |
 | 6 | `teamCreate` KR met triage aan | GraphQL | Nu pas; twee teams is het maximum |
 | 7 | `workflowStates(team)` lezen op beide teams | GraphQL | Zien welke standaardstatussen Linear zelf heeft gemaakt |
 | 8 | `workflowStateCreate` voor alle eigen statussen, in positievolgorde met de juiste types | GraphQL | **Eenrichtingsdeur:** `type` is achteraf onwijzigbaar |
@@ -1387,7 +1390,7 @@ De volgorde is dwingend; twee stappen zijn een eenrichtingsdeur.
 7. **Reviewers die te vroeg goed roepen.** Verifieerders hebben een gemeten neiging succes te melden na oppervlakkige controle. Afvang: twee reviewers uit verschillende modelfamilies die elkaars oordeel niet zien, een reviewprompt die letterlijk een volledig gedraaide testsuite eist, en de regel dat "niet te verifiëren" automatisch afkeuren betekent.
 8. **De klantstem is verzonnen door dezelfde machine die het werk doet.** Afvang: de klantstem draait op een ander model dan de uitvoerder en de reviewer, de acceptatiecriteria liggen vast vóór de uitvoering begint, haar oordeel is niet gezaghebbend (Poort 2 is de mens), en er is één zichtbare afkeurlus.
 9. **De demo leest mooier dan de werkelijkheid.** Een kijker ziet vier klanten netjes door de molen gaan en concludeert dat de AI het bureau runt. Afvang: de twee kopgetallen vóór het bord (12), het permanent zichtbare aantal menselijke handelingen op het bedieningspaneel, en het eerlijkheidsdocument.
-10. **Kwaliteit van tekst, design en campagnes heeft geen machinale poort.** Voor code is er CI en een tweede reviewer; voor een advertentietekst is er alleen het oordeel van een tweede model. Afvang: reviewer nooit hetzelfde model als de maker, bewijs per criterium in plaats van een vinkje, en menselijke eindredactie bij alles met `risico/publiek`.
+10. **Kwaliteit van tekst, design en campagnes heeft geen machinale poort.** Voor code is er CI en een tweede reviewer; voor een advertentietekst is er alleen het oordeel van een tweede model. Afvang: reviewer nooit hetzelfde model als de maker, bewijs per criterium in plaats van een vinkje, en menselijke eindredactie bij alles met `risico-publiek`.
 11. **Publiek werk voor verzonnen bedrijven.** Casepagina's en artikelen over Zoutkaap, Kantelbeer en Spoorlinde komen echt online. Afvang: elke publieke pagina van een fictieve klant draagt zichtbaar dat het een demonstratiebedrijf van Raderwerk is, de transparantiepagina legt de werkwijze uit, en elke publieke tekst passeert menselijke eindredactie die met naam en tijdstip wordt genoteerd.
 12. **Cycles op een team dat 24/7 doorwerkt zijn deels theater.** De cyclus is hier vooral een WIP-limiet op de poortcapaciteit van één mens. Afvang: de PM start geen nieuw werk zodra er meer dan zes issues in poortstatussen staan.
 13. **Verwijderen is grotendeels onomkeerbaar.** `permanentlyDelete` kent geen prullenbak. De exportregel is het enige vangnet.

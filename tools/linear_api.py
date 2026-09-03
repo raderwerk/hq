@@ -36,11 +36,14 @@ MAX_ATTEMPTS = 6
 BASE_BACKOFF = 2.0
 MAX_BACKOFF = 60.0
 
-# Stop and wait when the hourly request budget gets thin.
+# Stop and wait when the hourly request budget gets thin. A rate-limit window is
+# hourly, so a wait driven by a `*-Reset` header may legitimately be ~60 minutes.
 REQUEST_FLOOR = 40
 COMPLEXITY_FLOOR = 20000
+RESET_WAIT_CAP = 3900.0
 
 _KEY_CACHE = None
+_KEY_SOURCE = None
 _LAST_HEADERS = {}
 _STATS = {"requests": 0, "retries": 0, "complexity": 0.0}
 
@@ -71,19 +74,32 @@ class LinearError(RuntimeError):
 
 
 def api_key():
-    global _KEY_CACHE
+    global _KEY_CACHE, _KEY_SOURCE
     if _KEY_CACHE is None:
         env = os.environ.get("LINEAR_API_KEY")
         if env:
             _KEY_CACHE = env.strip()
+            _KEY_SOURCE = "env:LINEAR_API_KEY"
         else:
             if not os.path.exists(API_KEY_PATH):
                 raise LinearError("No API key: set LINEAR_API_KEY or create %s" % API_KEY_PATH)
             with open(API_KEY_PATH, "r", encoding="utf-8") as fh:
                 _KEY_CACHE = fh.read().strip()
+            _KEY_SOURCE = "file:%s" % API_KEY_PATH
         if not _KEY_CACHE:
-            raise LinearError("API key file %s is empty" % API_KEY_PATH)
+            raise LinearError("API key from %s is empty" % _KEY_SOURCE)
     return _KEY_CACHE
+
+
+def key_source():
+    """Where the key came from -- never the key itself.
+
+    An exported LINEAR_API_KEY silently wins over the key file, which is exactly
+    how a destructive run ends up pointed at somebody else's workspace, so the
+    caller prints this next to the workspace-identity check.
+    """
+    api_key()
+    return _KEY_SOURCE
 
 
 def last_headers():
@@ -94,8 +110,8 @@ def stats():
     return dict(_STATS)
 
 
-def _sleep(seconds, reason=""):
-    seconds = max(0.0, min(seconds, 300.0))
+def _sleep(seconds, reason="", cap=300.0):
+    seconds = max(0.0, min(seconds, cap))
     if seconds <= 0:
         return
     if reason:
@@ -123,7 +139,7 @@ def _respect_budget():
             if int(float(remaining)) < REQUEST_FLOOR:
                 wait = _reset_wait(_LAST_HEADERS.get("x-ratelimit-requests-reset"))
                 if wait:
-                    _sleep(wait, "request budget nearly exhausted")
+                    _sleep(wait, "request budget nearly exhausted", cap=RESET_WAIT_CAP)
                     return
         except ValueError:
             pass
@@ -133,13 +149,19 @@ def _respect_budget():
             if float(remaining) < COMPLEXITY_FLOOR:
                 wait = _reset_wait(_LAST_HEADERS.get("x-ratelimit-complexity-reset"))
                 if wait:
-                    _sleep(wait, "complexity budget nearly exhausted")
+                    _sleep(wait, "complexity budget nearly exhausted", cap=RESET_WAIT_CAP)
         except ValueError:
             pass
 
 
-def gql(query, variables=None, timeout=90):
-    """Run one GraphQL operation. Returns the `data` object, raises LinearError."""
+def gql(query, variables=None, timeout=90, retry_transport=True):
+    """Run one GraphQL operation. Returns the `data` object, raises LinearError.
+
+    `retry_transport=False` keeps the 429 retry (the request provably did not run)
+    but never re-POSTs after a 5xx, a timeout or a socket error. Mutations pass it:
+    a lost response to an `issueCreate` that Linear did commit would otherwise be
+    retried into a duplicate record.
+    """
     global _LAST_HEADERS
     payload = json.dumps({"query": query, "variables": variables or {}}).encode("utf-8")
     headers = {
@@ -178,10 +200,14 @@ def gql(query, variables=None, timeout=90):
         except ValueError:
             pass
 
-        retryable = status is None or status == 429 or (status is not None and status >= 500)
+        transport_failure = status is None or (status is not None and status >= 500)
+        retryable = status == 429 or (transport_failure and retry_transport)
+        if not retryable and transport_failure and body is None:
+            raise LinearError("Network failure (no retry, mutation may or may not have "
+                              "landed -- re-run and let name matching reconcile): %s" % last_exc)
         if retryable and attempt < MAX_ATTEMPTS:
             _STATS["retries"] += 1
-            wait = None
+            wait, cap = None, 300.0
             if status == 429:
                 wait = _reset_wait(_LAST_HEADERS.get("x-ratelimit-requests-reset"))
                 if wait is None:
@@ -189,10 +215,11 @@ def gql(query, variables=None, timeout=90):
                         wait = float(_LAST_HEADERS.get("retry-after", ""))
                     except ValueError:
                         wait = None
+                cap = RESET_WAIT_CAP
             if wait is None:
                 wait = min(MAX_BACKOFF, BASE_BACKOFF * (2 ** (attempt - 1)))
                 wait += random.uniform(0, 0.5 * wait)
-            _sleep(wait, "HTTP %s, attempt %d/%d" % (status, attempt, MAX_ATTEMPTS))
+            _sleep(wait, "HTTP %s, attempt %d/%d" % (status, attempt, MAX_ATTEMPTS), cap=cap)
             continue
 
         if body is None:
@@ -239,6 +266,7 @@ def paginate(query, path, variables=None, page_size=50, min_page_size=5):
     after = None
     size = page_size
     guard = 0
+    rate_limit_waits = 0
     while True:
         guard += 1
         if guard > 2000:
@@ -249,7 +277,14 @@ def paginate(query, path, variables=None, page_size=50, min_page_size=5):
         try:
             data = gql(query, vars_now)
         except LinearError as exc:
-            too_big = exc.matches("complexity", "too complex", "query is too large", "RATELIMITED")
+            # Two different failures that must not share one remedy: a complexity
+            # rejection wants a smaller page, a rate limit wants the reset window.
+            if exc.matches("RATELIMITED", "rate limit") and rate_limit_waits < 3:
+                rate_limit_waits += 1
+                wait = _reset_wait(last_headers().get("x-ratelimit-requests-reset")) or 60.0
+                _sleep(wait, "rate limited while paging %s" % path, cap=RESET_WAIT_CAP)
+                continue
+            too_big = exc.matches("complexity", "too complex", "query is too large")
             if too_big and size > min_page_size:
                 size = max(min_page_size, size // 2)
                 sys.stderr.write("  ... complexity hit, retrying %s with first=%d\n" % (path, size))
@@ -268,8 +303,14 @@ def paginate(query, path, variables=None, page_size=50, min_page_size=5):
             return nodes
 
 
-def page(root, fields, include_archived=False, page_size=50, extra="", variables=None):
-    """Page a root connection by name, retrying without includeArchived if rejected."""
+def page(root, fields, include_archived=False, page_size=50, extra="", variables=None,
+         on_problem=None):
+    """Page a root connection by name, retrying without includeArchived if rejected.
+
+    A silent fallback to a non-archived listing would hide archived records from
+    the caller (an archived team that still eats a plan slot, say), so the caller
+    can pass `on_problem` to have that recorded rather than printed and forgotten.
+    """
     for use_archived in ([True, False] if include_archived else [False]):
         args = ["first: $first", "after: $after"]
         if use_archived:
@@ -284,7 +325,11 @@ def page(root, fields, include_archived=False, page_size=50, extra="", variables
             return paginate(query, root, variables=variables, page_size=page_size)
         except LinearError as exc:
             if use_archived and exc.matches("includeArchived", "Unknown argument"):
-                sys.stderr.write("  (%s does not accept includeArchived, retrying)\n" % root)
+                message = ("%s does not accept includeArchived; archived records are NOT in "
+                           "this listing (%s)" % (root, exc))
+                sys.stderr.write("  (%s)\n" % message)
+                if on_problem:
+                    on_problem(message)
                 continue
             raise
     return []

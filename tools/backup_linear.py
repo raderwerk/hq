@@ -8,6 +8,11 @@ issues incl. archived (+ comments), cycles, project statuses.
 
     python3 backup_linear.py [--out PATH] [--no-archived]
 
+Writes a fresh timestamped file every run and never overwrites an existing one:
+after a permanent teardown this file is the only rollback path, so it must not be
+possible to replace a good export with a partial one. A run with section errors
+writes `<name>.partial` and exits non-zero.
+
 Never mutates anything.
 """
 
@@ -20,11 +25,12 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from linear_api import LinearError, gql, page, stats  # noqa: E402
 
-DEFAULT_OUT = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "linear",
-    "backup-2026-09-02.json",
-)
+BACKUP_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "linear")
+
+
+def default_out():
+    return os.path.join(BACKUP_DIR, time.strftime("backup-%Y-%m-%d-%H%M.json"))
 
 ORG_FIELDS = """
 id name urlKey createdAt updatedAt userCount createdIssueCount customerCount
@@ -125,10 +131,16 @@ PROJECT_STATUS_FIELDS = "id name description color position indefinite type team
 
 def main():
     parser = argparse.ArgumentParser(description="Export the whole Linear workspace to JSON")
-    parser.add_argument("--out", default=DEFAULT_OUT)
+    parser.add_argument("--out", default=None,
+                        help="default: linear/backup-<date-time>.json (never overwritten)")
     parser.add_argument("--no-archived", action="store_true", help="skip archived records")
     args = parser.parse_args()
     archived = not args.no_archived
+    out_path = args.out or default_out()
+    if os.path.exists(out_path):
+        sys.stderr.write("REFUSING: %s already exists; backups are never overwritten\n"
+                         % out_path)
+        return 2
 
     backup = {
         "_meta": {
@@ -186,22 +198,28 @@ def main():
     )
     backup["_meta"]["counts"] = counts
 
-    out_dir = os.path.dirname(os.path.abspath(args.out))
+    # A failed section leaves an incomplete export. Park it under a name the
+    # `backup-*.json` glob does not match, so it can never be picked up as the
+    # rollback file for a teardown.
+    if backup["_errors"]:
+        out_path += ".partial"
+    out_dir = os.path.dirname(os.path.abspath(out_path))
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
-    tmp = args.out + ".tmp"
+    tmp = out_path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(backup, fh, ensure_ascii=False, indent=1)
-    os.replace(tmp, args.out)
+    os.replace(tmp, out_path)
 
-    print("Backup written to %s (%.1f KB)" % (args.out, os.path.getsize(args.out) / 1024.0))
+    print("Backup written to %s (%.1f KB)" % (out_path, os.path.getsize(out_path) / 1024.0))
     print("Counts:")
     for key in sorted(counts):
         print("  %-20s %d" % (key, counts[key]))
     print("API: %d requests, %d retries, %.0f complexity points"
           % (stats()["requests"], stats()["retries"], stats()["complexity"]))
     if backup["_errors"]:
-        print("ERRORS in sections: %s" % ", ".join(sorted(backup["_errors"])))
+        print("ERRORS in sections: %s -- this export is INCOMPLETE and cannot gate a teardown"
+              % ", ".join(sorted(backup["_errors"])))
         return 1
     return 0
 

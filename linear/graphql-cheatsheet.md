@@ -273,8 +273,9 @@ ProjectLabelCreateInput = {
 ```
 Payload: `{ lastSyncId: Float, projectLabel: ProjectLabel, success: Boolean }`. There is also
 `projectLabelUpdate(id, input: ProjectLabelUpdateInput): ProjectLabelPayload` (not expanded here,
-mirrors `IssueLabelUpdateInput` shape) and no `projectLabelDelete` was found in the searched
-mutation list (**NOT FOUND** — only create/update confirmed).
+mirrors `IssueLabelUpdateInput` shape) and `projectLabelDelete(id: String!): DeletePayload`
+(verified by introspection on 2026-09-03; an earlier note in this file wrongly said it did not
+exist).
 
 ---
 
@@ -1096,7 +1097,6 @@ per-field-triple-checked" if you need 100% certainty on an uncommon one).
   settings/UI-managed).
 - `customerStatusCreate/Update/Delete`, `customerTierCreate/Update/Delete` — same: not found,
   likely workspace-settings/UI-managed only.
-- `projectLabelDelete` — not found in the mutation list searched (only `projectLabelCreate`/`Update` confirmed).
 - Exact grace-period length before `teamDelete`'s scheduled data deletion becomes irreversible —
   not exposed in the GraphQL schema (support-docs territory).
 - Exact JSON key schema inside `Template.templateData` — the GraphQL schema only types it as an
