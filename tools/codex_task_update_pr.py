@@ -30,7 +30,8 @@ def main():
         if os.path.exists(p):
             sh(f'git worktree remove --force {p}', cwd=repo_dir, check=False)
     # tree T2 = main + full diff
-    sh(f'git worktree add -q --detach {tmp} origin/main', cwd=repo_dir)
+    base = sh(f'git merge-base origin/main origin/{branch}', cwd=repo_dir)
+    sh(f'git worktree add -q --detach {tmp} {base}', cwd=repo_dir)
     sh(f'git apply --3way /tmp/{issue}-update.diff', cwd=tmp)
     sh('git add -A && git -c commit.gpgsign=false commit -q -m "tmp"', cwd=tmp)
     t2 = sh('git rev-parse HEAD', cwd=tmp)
