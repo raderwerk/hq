@@ -36,7 +36,7 @@ def main():
     sh('git add -A && git -c commit.gpgsign=false commit -q -m "tmp"', cwd=tmp)
     t2 = sh('git rev-parse HEAD', cwd=tmp)
     # put T2 on top of the PR branch
-    sh(f'git worktree add -q {wt} {branch}', cwd=repo_dir)
+    sh(f'git worktree add -q -B {branch} {wt} origin/{branch}', cwd=repo_dir)
     sh(f'git rm -r -q . && git checkout {t2} -- . && git add -A', cwd=wt)
     if not sh('git status --porcelain', cwd=wt):
         print('no changes vs branch'); return
