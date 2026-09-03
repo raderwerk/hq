@@ -36,13 +36,13 @@ def main():
     sh('git add -A && git -c commit.gpgsign=false commit -q -m "tmp"', cwd=tmp)
     t2 = sh('git rev-parse HEAD', cwd=tmp)
     # put T2 on top of the PR branch
-    sh(f'git worktree add -q -B {branch} {wt} origin/{branch}', cwd=repo_dir)
+    sh(f'git worktree add -q --detach {wt} origin/{branch}', cwd=repo_dir)
     sh(f'git rm -r -q . && git checkout {t2} -- . && git add -A', cwd=wt)
     if not sh('git status --porcelain', cwd=wt):
         print('no changes vs branch'); return
     sh(f'git -c commit.gpgsign=false commit -q -m "{title} ({issue})\n\nReview fixes produced by Codex (GPT-5.6 Sol) in its cloud sandbox, applied from the Codex cloud task diff by the orchestrator.\n\nCo-Authored-By: Codex <codex@openai.com>"', cwd=wt)
     sha = sh('git rev-parse --short HEAD', cwd=wt)
-    sh(f'git push -q origin {branch}', cwd=wt)
+    sh(f'git push -q origin HEAD:{branch}', cwd=wt)
     sh(f'git worktree remove --force {tmp}', cwd=repo_dir, check=False)
     pr = sh(f'gh pr list -R raderwerk/{repo} --head {branch} --json url --jq ".[0].url"')
     body = f"[Spil / orchestrator] Reviewbevindingen verwerkt door Codex (cloudtaak {task}); toegepast als commit {sha} op {branch}. Reviewer: graag opnieuw beoordelen."
