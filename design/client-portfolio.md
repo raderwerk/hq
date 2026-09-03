@@ -142,7 +142,7 @@ Methode: HTTP-status van `github.com/<naam>` (404 = vrij) en RDAP via rdap.org v
 
 **Waarom dit de vierde klant is.** Het bureau behandelt zichzelf als klant en laat zijn eigen engagement dezelfde drie poorten doorlopen. Doet het dat niet, dan bewijst de demo niets over de werkbaarheid van de eigen werkwijze. Bovendien is dit de etalage: raderwerk.github.io (GitHub Pages; voorlopig geen eigen domein) legt uit hoe het bureau werkt en toont vier cases, waarvan drie fictief en zichtbaar als zodanig gemarkeerd.
 
-**Engagements.** P6 merk en site, P7 contentmotor en social. Beide `facturatie/intern`, dus niet declarabel, maar wél volledig door de reis inclusief factuurconcept — anders is het geen bewijs.
+**Engagements.** P6 merk en site, P7 contentmotor en social. Beide `facturatie/niet-factureerbaar`, dus niet declarabel, maar wél volledig door de reis inclusief factuurconcept — anders is het geen bewijs.
 
 **Repositories.** `raderwerk/raderwerk-site`, `raderwerk/agency-os` (Spil, controlescripts, exports, kostenboek-verzamelaar).
 

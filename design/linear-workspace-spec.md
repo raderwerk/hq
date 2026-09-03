@@ -206,10 +206,10 @@ Leeg laten is normaal: het rolcontract bepaalt het model. Een expliciet label wi
 `run/wachtrij` · `run/bezet` (het claimlabel) · `run/klaar` · `run/mislukt` · `run/vastgelopen` (twee keer afgekeurd op dezelfde poort, of twee keer mislukt) · `run/onbevestigd` (een poort is gepasseerd zonder geldig token; het issue staat stil tot een mens het uitzoekt)
 
 ### 3.8 `schakelaar` — `#D0021B` (noodrem en toestand)
-`schakelaar/pauze` (dit issue wordt overgeslagen) · `schakelaar/pauze-alles` (alleen zinvol op WV-1: alles stopt) · `schakelaar/wacht-op-mens` (vraag buiten een poort om) · `schakelaar/motor-dood` (gezet door de wachthond als de hartslag verlopen is)
+`schakelaar/pauze` (dit issue wordt overgeslagen) · `schakelaar/pauze-alles` (alleen zinvol op WV-1: alles stopt) · `schakelaar/mens-vereist` (vraag buiten een poort om) · `schakelaar/motor-dood` (gezet door de wachthond als de hartslag verlopen is)
 
 ### 3.9 `facturatie` — `#0F783C`
-`facturatie/vaste-prijs` · `facturatie/nacalculatie` · `facturatie/retainer` · `facturatie/garantie` · `facturatie/intern` · `facturatie/gefactureerd`
+`facturatie/vaste-prijs` · `facturatie/nacalculatie` · `facturatie/retainer` · `facturatie/garantie` · `facturatie/niet-factureerbaar` · `facturatie/gefactureerd`
 
 `facturatie/garantie` wordt automatisch gezet zodra herstelwerk volgt op een eigen fout. Zo wordt first-pass-acceptatie zichtbaar in geld en niet alleen als percentage.
 
@@ -938,7 +938,7 @@ Alle vijf de voorwaarden moeten tegelijk gelden:
 Deze drie regels zijn een harde controle in de code, vlak vóór elke schrijfactie, niet alleen een afspraak in dit document.
 
 ## Wat er gebeurt bij een poort die zonder geldig token is gepasseerd
-Het issue stopt. De dispatcher zet `run/onbevestigd` en `schakelaar/wacht-op-mens`, schrijft één comment met wat hij zag, en raakt het issue niet meer aan tot een mens het opheft. Hij gaat nooit "gewoon door" met de aantekening dat het niet klopte.
+Het issue stopt. De dispatcher zet `run/onbevestigd` en `schakelaar/mens-vereist`, schrijft één comment met wat hij zag, en raakt het issue niet meer aan tot een mens het opheft. Hij gaat nooit "gewoon door" met de aantekening dat het niet klopte.
 ```
 
 ### D03 — Rolcontract, basis (volledige tekst)
@@ -1206,7 +1206,7 @@ artefacten:
 ```
 ````
 
-Vier uitkomsten en wat Spil ermee doet: `klaar` → verplaats en zet `run/klaar`. `vraag` → naar Wacht op input, `schakelaar/wacht-op-mens`, toewijzen aan de mens. `mislukt` → blijf staan, `run/mislukt`, faalteller op; na twee mislukkingen op dezelfde status stopt Spil met dit issue en maakt er een vraag van. `afgebroken` → terug op `run/wachtrij`.
+Vier uitkomsten en wat Spil ermee doet: `klaar` → verplaats en zet `run/klaar`. `vraag` → naar Wacht op input, `schakelaar/mens-vereist`, toewijzen aan de mens. `mislukt` → blijf staan, `run/mislukt`, faalteller op; na twee mislukkingen op dezelfde status stopt Spil met dit issue en maakt er een vraag van. `afgebroken` → terug op `run/wachtrij`.
 
 ### 8.4 Hartslag en een onafhankelijke wachthond
 
