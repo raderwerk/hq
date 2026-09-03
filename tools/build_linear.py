@@ -27,7 +27,9 @@ from linear_api import (LinearError, gql, key_source, last_headers,  # noqa: E40
                         page, stats)
 import linear_check  # noqa: E402
 import linear_guard  # noqa: E402
-from linear_common import TEAM_SETTINGS, Plan, label_key, norm  # noqa: E402
+from linear_common import (RESERVED_STATE_TYPES, TEAM_SETTINGS,  # noqa: E402
+                           TEMPLATE_BODY_KEYS, TEMPLATE_SERVER_BLOBS, Plan,
+                           label_key, norm, norm_markdown, parse_template_data)
 from linear_probe import Probe  # noqa: E402
 from linear_teardown import LEGACY_TEAM_ID, Teardown  # noqa: E402
 
@@ -148,8 +150,11 @@ class Builder(object):
                               query=query, variables=variables)
         return node
 
-    @staticmethod
-    def diff_fields(live, wanted):
+    # Bodies Linear re-serialises; see norm_markdown for what it rewrites.
+    MARKDOWN_FIELDS = ("description", "content")
+
+    @classmethod
+    def diff_fields(cls, live, wanted):
         """Fields in `wanted` whose live value differs (None in wanted = leave alone)."""
         out = {}
         for key, value in wanted.items():
@@ -157,7 +162,10 @@ class Builder(object):
                 continue
             current = live.get(key)
             if isinstance(value, str) and isinstance(current, str):
-                if value.strip() != current.strip():
+                if key in cls.MARKDOWN_FIELDS:
+                    if norm_markdown(value) != norm_markdown(current):
+                        out[key] = value
+                elif value.strip() != current.strip():
                     out[key] = value
             elif current != value:
                 out[key] = value
@@ -345,11 +353,7 @@ class Builder(object):
                 self.put_id("team", key, live["id"])
                 changes = self.diff_fields(live, wanted)
                 if changes:
-                    self.mutate("team", "update", key,
-                                "mutation($id: String!, $input: TeamUpdateInput!) "
-                                "{ teamUpdate(id: $id, input: $input) { success team { id } } }",
-                                {"id": live["id"], "input": changes}, "teamUpdate.team",
-                                detail=", ".join(sorted(changes)))
+                    self.update_team(key, live["id"], changes)
                 else:
                     self.plan.add("ok", "team", key, "already matches spec")
             else:
@@ -359,6 +363,36 @@ class Builder(object):
                 self.by_team_key[key] = self.fresh_team_states(spec_team, team_id)
             self.build_states(spec_team)
             self.checkpoint()
+
+    TEAM_UPDATE = ("mutation($id: String!, $input: TeamUpdateInput!) "
+                   "{ teamUpdate(id: $id, input: $input) { success team { id } } }")
+
+    def update_team(self, key, team_id, changes):
+        """teamUpdate, except that an icon Linear dislikes must not kill the run.
+
+        `teamCreate` silently drops an icon outside Linear's vocabulary, but
+        `teamUpdate` rejects the entire payload with 'Argument Validation Error'.
+        The same spec value therefore passes when the team is created and fails on
+        every run after that, taking the other settings in the payload with it.
+        Probed 2026-09-03: the vocabulary is closed -- 'Wrench' is in it, 'Gear'
+        is not -- so the icon is dropped and reported, and the rest still lands.
+        """
+        try:
+            return self.mutate("team", "update", key, self.TEAM_UPDATE,
+                               {"id": team_id, "input": changes}, "teamUpdate.team",
+                               detail=", ".join(sorted(changes)))
+        except LinearError as exc:
+            if "icon" not in changes or not exc.matches("Argument Validation Error", "icon"):
+                raise
+            rejected = changes.pop("icon")
+            self.plan.problem(
+                "team %s: Linear refused icon %r, so the team keeps the one it has. Choose an "
+                "icon from Linear's own set or drop it from the spec." % (key, rejected))
+            if not changes:
+                return None
+            return self.mutate("team", "update", key, self.TEAM_UPDATE,
+                               {"id": team_id, "input": changes}, "teamUpdate.team",
+                               detail="retry without icon: " + ", ".join(sorted(changes)))
 
     def fresh_team_states(self, spec_team, team_id):
         """States a just-created team has: read them back, or predict them in a dry run."""
@@ -421,8 +455,9 @@ class Builder(object):
         matched = set()
         for spec_state in spec_team.get("states", []):
             name = spec_state["name"]
+            # `position` is deliberately absent: see STATE_SERVER_OWNED. It is
+            # still sent on create below, where Linear sometimes honours it.
             wanted = {"name": name, "color": spec_state.get("color"),
-                      "position": spec_state.get("position"),
                       "description": spec_state.get("description")}
             live = by_name.get(norm(name))
             if live is None and spec_state["type"] == "triage":
@@ -443,6 +478,20 @@ class Builder(object):
                         "team %s state %r is type %r but the spec wants %r; "
                         "WorkflowStateUpdateInput cannot change type, so this state has to be "
                         "recreated by hand" % (key, name, live["type"], spec_state["type"]))
+                if spec_state["type"] in RESERVED_STATE_TYPES:
+                    # See RESERVED_STATE_TYPES: every field of this state is
+                    # refused, so there is nothing to reconcile. It is already
+                    # registered under the spec's name above, which is what the
+                    # issues need -- they route by id, not by label.
+                    if norm(live["name"]) != norm(name):
+                        self.plan.problem(
+                            "team %s: the %s state is reserved by Linear and refuses every "
+                            "update, so the board keeps calling it %r where the spec says %r. "
+                            "Issues still land in it correctly; only the label differs."
+                            % (key, spec_state["type"], live["name"], name))
+                    self.plan.add("keep", "state", "%s/%s" % (key, name),
+                                  "reserved %s state, not updatable" % spec_state["type"])
+                    continue
                 changes = self.diff_fields(live, wanted)
                 if changes:
                     self.mutate("state", "update", "%s/%s" % (key, name),
@@ -583,11 +632,28 @@ class Builder(object):
         if spec_label.get("teamKey"):
             payload["teamId"] = self.get_id("team", spec_label["teamKey"])
         payload = {k: v for k, v in payload.items() if v is not None}
-        node = self.mutate("label", "create", key,
-                           "mutation($input: IssueLabelCreateInput!) "
-                           "{ issueLabelCreate(input: $input) { success issueLabel { id } } }",
-                           {"input": payload}, "issueLabelCreate.issueLabel",
-                           detail=("group" if is_group else (spec_label.get("group") or "flat")))
+        try:
+            node = self.mutate("label", "create", key,
+                               "mutation($input: IssueLabelCreateInput!) "
+                               "{ issueLabelCreate(input: $input) { success issueLabel { id } } }",
+                               {"input": payload}, "issueLabelCreate.issueLabel",
+                               detail=("group" if is_group
+                                       else (spec_label.get("group") or "flat")))
+        except LinearError as exc:
+            if not exc.matches("duplicate label name"):
+                raise
+            # Linear label names are unique across the whole workspace, groups
+            # included, so two groups cannot both hold a child called `intern`.
+            # Which of the two keeps the name is a design decision, not one this
+            # tool may make: register no id, so every reference to this label is
+            # reported by resolve_label_id instead of silently landing on the
+            # namesake in the other group.
+            self.plan.problem(
+                "label %r refused as a duplicate: Linear label names are unique workspace-wide "
+                "and %r already exists under another group. Every issue and template that "
+                "references %r loses that label until one of the two is renamed in the spec."
+                % (key, name, key))
+            return
         self.put_id("label", key, node["id"] if node else self.placeholder("label", key))
 
     def sync_project_label(self, name):
@@ -798,12 +864,24 @@ class Builder(object):
                 changes = {}
                 if (live.get("description") or "") != (spec_template.get("description") or ""):
                     changes["description"] = spec_template.get("description") or ""
-                # templateData is an opaque blob that Linear normalises and adds
-                # keys to, so compare only the keys the spec owns and merge the
-                # server's own keys back in instead of wiping them.
-                live_data = live.get("templateData") or {}
-                if any(live_data.get(k) != v for k, v in data.items()):
-                    changes["templateData"] = dict(live_data, **data)
+                # See TEMPLATE_BODY_KEYS: templateData arrives as a JSON string,
+                # and the markdown body is rendered into a server blob under a
+                # different key, so only the keys Linear echoes back verbatim can
+                # be compared. The body rides along on any real change.
+                live_data = parse_template_data(live.get("templateData"))
+                drift = sorted(k for k, v in data.items()
+                               if k not in TEMPLATE_BODY_KEYS and live_data.get(k) != v)
+                if drift:
+                    merged = {k: v for k, v in live_data.items()
+                              if k not in TEMPLATE_SERVER_BLOBS}
+                    merged.update(data)
+                    changes["templateData"] = merged
+                    self.plan.note("template %r: templateData drift on %s"
+                                   % (name, ", ".join(drift)))
+                elif any(k in data for k in TEMPLATE_BODY_KEYS):
+                    self.plan.note("template bodies are not reconciled on re-runs: Linear stores "
+                                   "them as rendered blobs, so an edited body in the spec only "
+                                   "lands if another templateData key changes with it")
                 if changes:
                     self.mutate("template", "update", label,
                                 "mutation($id: String!, $input: TemplateUpdateInput!) "
@@ -1002,7 +1080,7 @@ class Builder(object):
 
     # ---------- orchestration ----------
 
-    def run(self, backup_path, backup_required, org_arg=None):
+    def run(self, backup_path, backup_required, org_arg=None, probe_only=False):
         self.load_snapshot()
         self.guard_workspace(org_arg)
         self.preflight()
@@ -1013,6 +1091,14 @@ class Builder(object):
         prober = Probe(self) if self.probe else None
         if prober:
             prober.before_teardown(LEGACY_TEAM_ID)
+        if probe_only:
+            # Stop here on purpose. The two questions that gate the teardown --
+            # does permanentlyDelete really remove an issue, and what does Linear
+            # store in templateData -- are now settled against the legacy team,
+            # while everything is still intact. The triage-state question cannot
+            # be asked at this point: that state does not exist until teamCreate
+            # makes KR, so plain --probe answers it mid-build instead.
+            return
         if self.teardown:
             Teardown(self).run()
             if self.apply:
@@ -1060,6 +1146,8 @@ def main():
                         help="empty the old workspace and rename its team into the spec's")
     parser.add_argument("--probe", action="store_true",
                         help="prove the unknown API shapes with throwaway records first")
+    parser.add_argument("--probe-only", action="store_true",
+                        help="run the pre-teardown probes and stop, changing nothing else")
     parser.add_argument("--backup-required", action="store_true",
                         help="hard-fail unless a complete, covering backup exists")
     parser.add_argument("--allow-tight-budget", action="store_true",
@@ -1073,7 +1161,7 @@ def main():
 
     with open(args.spec, "r", encoding="utf-8") as fh:
         spec = json.load(fh)
-    linear_check.validate_spec(spec)
+    spec_warnings = linear_check.validate_spec(spec)
 
     if args.verify:
         return linear_check.verify(
@@ -1084,11 +1172,16 @@ def main():
         parser.error("--apply and --dry-run are mutually exclusive")
 
     backup_path = args.backup or linear_guard.newest_backup(BACKUP_DIR)
-    builder = Builder(spec, apply_changes=args.apply, teardown=args.teardown,
-                      verbose=not args.quiet, probe=args.probe, idmap_path=args.idmap,
-                      allow_tight_budget=args.allow_tight_budget)
+    # --probe-only never tears anything down, so it must not be able to inherit
+    # --teardown from the command line and delete on the way to the probes.
+    teardown = args.teardown and not args.probe_only
+    builder = Builder(spec, apply_changes=args.apply, teardown=teardown,
+                      verbose=not args.quiet, probe=args.probe or args.probe_only,
+                      idmap_path=args.idmap, allow_tight_budget=args.allow_tight_budget)
+    for warning in spec_warnings:
+        builder.plan.problem("spec: %s" % warning)
     try:
-        builder.run(backup_path, args.backup_required, args.org)
+        builder.run(backup_path, args.backup_required, args.org, probe_only=args.probe_only)
     except LinearError as exc:
         sys.stderr.write("\nABORTED on a Linear error: %s\n" % exc)
         if exc.variables:

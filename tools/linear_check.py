@@ -7,16 +7,39 @@ so a contradiction in the spec costs nothing to find.
 """
 
 from linear_api import gql
-from linear_common import ESTIMATION_SCALES, TEAM_SETTINGS, label_key, norm
+from linear_common import (ESTIMATION_SCALES, RESERVED_STATE_TYPES, TEAM_SETTINGS,
+                           label_key, norm)
 
 INPUT_TYPE_RE = "$input: "
 
 
 def validate_spec(spec):
-    """Fail before the first request on anything the spec contradicts itself on."""
+    """Fail before the first request on anything the spec contradicts itself on.
+
+    Returns the non-fatal warnings: things Linear will not accept but that only a
+    human can resolve, so the build reports them instead of refusing to run.
+    """
     problems = []
+    warnings = []
     labels = spec.get("labels", [])
     groups = {norm(l["name"]) for l in labels if l.get("isGroup")}
+    # Linear label names are unique across the whole workspace, groups included:
+    # the second `intern` comes back "duplicate label name" however different its
+    # group (probed 2026-09-03). Which of the two keeps the name is a design call,
+    # so this is surfaced up front rather than raised 60 labels into the run.
+    by_name = {}
+    for label in labels:
+        by_name.setdefault(norm(label["name"]), []).append(label.get("group") or "(ungrouped)")
+    for name, in_groups in sorted(by_name.items()):
+        if len(in_groups) > 1:
+            users = sorted(
+                {i["title"] for i in spec.get("issues", [])
+                 for ref in i.get("labels") or [] if norm(ref).endswith("/" + name)})
+            warnings.append(
+                "label name %r is used by %d groups (%s). Linear label names are unique "
+                "workspace-wide, so only the first survives and the rest are dropped, along "
+                "with the label on the %d issue(s) that reference them. Rename one in the spec "
+                "to keep both." % (name, len(in_groups), ", ".join(in_groups), len(users)))
     keys = {}
     group_of = {}
     for label in labels:
@@ -120,6 +143,7 @@ def validate_spec(spec):
     if problems:
         raise SystemExit("REFUSING TO RUN: the spec contradicts itself\n  - %s"
                          % "\n  - ".join(sorted(problems)))
+    return warnings
 
 
 def validate_inputs(plan):
@@ -201,8 +225,14 @@ def verify(spec, builder, org_arg=None):
             ["%s (%s)" % (t["key"], t["name"]) for t in builder.snapshot["teams"]])
     for spec_team in spec["teams"]:
         live_team = builder.by_team_key.get(spec_team["key"]) or {}
+        # A reserved state (triage) refuses every update, so it keeps Linear's own
+        # name however the spec labels it. Match that one on type -- the thing
+        # that actually routes issues. Every other state still compares by name,
+        # so the exemption cannot hide real drift.
+        reserved = {s["type"]: s["name"] for s in spec_team["states"]
+                    if s["type"] in RESERVED_STATE_TYPES}
         # Type matters: a state of the wrong type cannot be repaired by an update.
-        live_states = ["%s [%s]" % (s["name"], s["type"])
+        live_states = ["%s [%s]" % (reserved.get(s["type"], s["name"]), s["type"])
                        for s in (live_team.get("states") or {}).get("nodes", [])
                        if not s.get("archivedAt")]
         compare("states/%s" % spec_team["key"],

@@ -21,6 +21,7 @@ import sys
 import time
 
 from linear_api import LinearError, gql
+from linear_common import TEMPLATE_BODY_KEYS, parse_template_data
 
 PREFIX = "zz-probe"
 
@@ -87,18 +88,33 @@ class Probe(object):
             if not self.builder.apply:
                 return
             template_id = node["id"]
-            live = gql(TEMPLATE_READBACK, {"id": template_id})["template"]["templateData"] or {}
-            drifted = {k: (v, live.get(k)) for k, v in data.items() if live.get(k) != v}
+            raw = gql(TEMPLATE_READBACK, {"id": template_id})["template"]["templateData"]
+            live = parse_template_data(raw)
             added = sorted(k for k in live if k not in data)
+            body = sorted(k for k in data if k in TEMPLATE_BODY_KEYS)
+            # A body key is *expected* to vanish: Linear renders it into its own
+            # blob under another name. Any other key coming back changed is what
+            # would make the build rewrite every template on every run.
+            drifted = {k: (v, live.get(k)) for k, v in data.items()
+                       if k not in TEMPLATE_BODY_KEYS and live.get(k) != v}
+            self.results["templateDataIsJsonString"] = isinstance(raw, str)
             self.results["templateDataKeys"] = sorted(data)
             self.results["templateDataServerKeys"] = added
+            self.results["templateDataBodyDropped"] = [k for k in body if k not in live]
             self.results["templateDataDrift"] = sorted(drifted)
-            self.note("templateData came back with %d server-added key(s): %s"
-                      % (len(added), ", ".join(added) or "none"))
+            self.note("templateData reads back as %s; server-added key(s): %s; body key(s) "
+                      "rendered away: %s"
+                      % ("a JSON string" if isinstance(raw, str) else type(raw).__name__,
+                         ", ".join(added) or "none",
+                         ", ".join(k for k in body if k not in live) or "none"))
             if drifted:
-                self.note("templateData values Linear rewrote: %s -- the build compares only the "
-                          "keys the spec owns, so this is survivable but worth knowing"
-                          % ", ".join(sorted(drifted)))
+                self.plan.problem(
+                    "probe: Linear rewrote non-body templateData key(s) %s (%s). The build "
+                    "compares exactly those keys, so every run would re-issue a templateUpdate "
+                    "for all of them. Fix the comparison before applying."
+                    % (", ".join(sorted(drifted)),
+                       "; ".join("%s sent %r, stored %r" % (k, s, l)
+                                 for k, (s, l) in sorted(drifted.items()))))
         finally:
             self.destroy("template",
                          "mutation($id: String!) { templateDelete(id: $id) { success } }",
@@ -179,12 +195,30 @@ class Probe(object):
         if delegate_id:
             payload["delegateId"] = delegate_id
 
+        create_issue = "mutation($input: IssueCreateInput!) " \
+                       "{ issueCreate(input: $input) { success issue { id } } }"
         issue_id = None
         try:
-            node = self.create("issue", "mutation($input: IssueCreateInput!) "
-                               "{ issueCreate(input: $input) { success issue { id } } }",
-                               {"input": payload}, "issueCreate.issue",
-                               detail="triage state, delegate, estimate 4, two labels of one group")
+            try:
+                node = self.create("issue", create_issue, {"input": payload}, "issueCreate.issue",
+                                   detail="triage state, delegate, estimate 4, two labels of "
+                                          "one group")
+            except LinearError as exc:
+                if len(label_ids) < 2 or not exc.matches("not exclusive child labels"):
+                    raise
+                # This rejection IS the answer to the question. A label group is
+                # single-select and Linear refuses the pair outright rather than
+                # quietly keeping one, so the spec self-check that forbids two
+                # labels of one group is what keeps every real payload legal.
+                # Drop back to one label to settle the other questions.
+                self.results["sameGroupLabelsRejected"] = True
+                self.note("two labels from one group are rejected outright ('not exclusive "
+                          "child labels'), not silently reduced -- validate_spec already "
+                          "forbids the pair, so no real issue can hit this")
+                label_ids = label_ids[:1]
+                payload["labelIds"] = label_ids
+                node = self.create("issue", create_issue, {"input": payload}, "issueCreate.issue",
+                                   detail="retry with one label of the group")
             if not self.builder.apply:
                 return
             issue_id = node["id"]
@@ -196,15 +230,23 @@ class Probe(object):
                          {"id": issue_id}, "issueDelete", issue_id)
 
     def check_readback(self, live, payload, description, labels, team_key, triage):
-        state = (live.get("state") or {}).get("name")
-        self.results["triageStateAccepted"] = bool(
-            triage and state and state == triage["name"])
-        if triage and state != triage["name"]:
-            self.results["triageStateAccepted"] = False
-            self.plan.problem(
-                "probe: issueCreate with the triage stateId landed in %r instead of %r; the %s "
-                "issues that want the triage state will be created without a stateId"
-                % (state, triage["name"], team_key))
+        # Compare the state by id, never by name: the triage state is reserved,
+        # so it keeps Linear's own label ("Triage") however the spec names it.
+        # Matching on the name would read as "not accepted" and strand every
+        # triage-bound issue in the team's default state instead.
+        sent_state = payload.get("stateId")
+        live_state = live.get("state") or {}
+        if sent_state:
+            self.results["triageStateAccepted"] = live_state.get("id") == sent_state
+            if live_state.get("id") != sent_state:
+                self.plan.problem(
+                    "probe: issueCreate with the triage stateId landed in %r (%s) instead of the "
+                    "state that was asked for; the %d %s issues that want the triage state will "
+                    "be created without a stateId"
+                    % (live_state.get("name"), live_state.get("type"),
+                       sum(1 for i in self.builder.spec["issues"]
+                           if i.get("teamKey") == team_key and triage
+                           and i.get("state") == triage["name"]), team_key))
 
         estimate = live.get("estimate")
         self.results["estimateRoundTrip"] = estimate
