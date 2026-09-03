@@ -2,7 +2,7 @@
 
 Date: 2026-09-02
 Runner: Claude subagent, no own web research (by design of this lane)
-Raw transcript: `/Users/youp/Developer/Personal/Raderwerk/research/lane-codex-gpt56-raw.md`
+Raw transcript: `/Users/youp/Developer/Personal/Raderwerk/hq/research/lane-codex-gpt56-raw.md`
 Codex session id: `01a06205-bbce-79a2-b1eb-200afc15795c` (codex-cli 0.147.0, model `gpt-5.6-sol`, reasoning `xhigh`, sandbox read-only, tokens used 128,302)
 
 ## Method
@@ -81,8 +81,8 @@ Confidence rule used: high = official vendor/institution URL that resolved (200)
 | 12 | EU AI Act Article 50 transparency obligations (disclosure of AI interaction / AI-generated content) apply since 2 August 2026; Commission guidelines published | https://digital-strategy.ec.europa.eu/en/library/guidelines-transparency-obligations-providers-and-deployers-ai-systems | 2026-08-02 | high | high |
 | 13 | CFO survey: 86% encountered inaccurate or hallucinated AI data; 97% consider human oversight at least somewhat critical | https://www.journalofaccountancy.com/news/2026/feb/agentic-ai-is-handling-more-finance-work-but-can-cfos-trust-it/ | 2026-02 | medium | medium |
 | 14 | Academic sales literature still lacks mature performance evidence for autonomous AI sales agents | https://www.sciencedirect.com/science/article/abs/pii/S0148296325006228 | 2025/2026 | medium (403 bot-block) | medium |
-| 15 | GPT verdict: ~60% of agency workload safely delegable (70-75% for standardized Shopify work, ~40% bespoke); lights-out agency ~20% feasible; per-function 35-75% | file:///Users/youp/Developer/Personal/Raderwerk/research/lane-codex-gpt56-raw.md | 2026-09-02 | low (analyst estimate) | high |
-| 16 | GPT demo design: Linear state machine + webhook router + idempotency ledger + isolated agent runs + GitHub PR/CI/preview + independent agent QA + human gates; reuse native Linear/Cursor integrations instead of a bespoke framework; buildable in 3-5 days | file:///Users/youp/Developer/Personal/Raderwerk/research/lane-codex-gpt56-raw.md | 2026-09-02 | medium (design recommendation) | high |
+| 15 | GPT verdict: ~60% of agency workload safely delegable (70-75% for standardized Shopify work, ~40% bespoke); lights-out agency ~20% feasible; per-function 35-75% | file:///Users/youp/Developer/Personal/Raderwerk/hq/research/lane-codex-gpt56-raw.md | 2026-09-02 | low (analyst estimate) | high |
+| 16 | GPT demo design: Linear state machine + webhook router + idempotency ledger + isolated agent runs + GitHub PR/CI/preview + independent agent QA + human gates; reuse native Linear/Cursor integrations instead of a bespoke framework; buildable in 3-5 days | file:///Users/youp/Developer/Personal/Raderwerk/hq/research/lane-codex-gpt56-raw.md | 2026-09-02 | medium (design recommendation) | high |
 
 ## What this means for the Fightclub AI-agency demo
 
