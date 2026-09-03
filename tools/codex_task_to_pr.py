@@ -34,6 +34,14 @@ def main():
     repo_dir = f'{ROOT}/{repo}'
     slug = re.sub(r'[^a-z0-9]+', '-', title.lower()).strip('-')[:40]
     branch = f'feat/{issue.lower()}-{slug}'
+    # --replace: an older PR for this issue exists and conflicts with main; open a fresh
+    # branch from current main, then close the old PR with a pointer to the new one.
+    replace_old = None
+    if '--replace' in sys.argv:
+        old_pr = sh(f'gh pr list -R raderwerk/{repo} --search "{issue} in:title" --state open --json number,headRefName --jq ".[0]"', check=False)
+        if old_pr:
+            old = json.loads(old_pr); replace_old = old['number']
+            branch = f'feat/{issue.lower()}-{slug}-v2' if old['headRefName'] == branch else branch
     wt = f'{ROOT}/.worktrees/{repo}/{issue}'
     sh('git fetch -q origin', cwd=repo_dir)
     if os.path.exists(wt):
@@ -72,6 +80,10 @@ Poort · Merge of publicatie: mens keurt en merget na Agentreview en QA. Agents 
     open(f'/tmp/{issue}-pr.md', 'w').write(body)
     pr = sh(f'gh pr create -R raderwerk/{repo} --head {branch} --base main --title "{title} ({issue})" --body-file /tmp/{issue}-pr.md', cwd=wt)
     print('PR', pr)
+    if replace_old:
+        sh(f'gh pr comment {replace_old} -R raderwerk/{repo} --body "[Spil / orchestrator] Vervangen door {pr}: deze branch stond in conflict met main na de merge van het contentmodel; de nieuwe PR is opnieuw op main gebouwd. Deze PR wordt gesloten, de branch blijft staan."')
+        sh(f'gh pr close {replace_old} -R raderwerk/{repo}')
+        print('closed old PR', replace_old)
     st = gql('query($t:String!){ workflowStates(filter:{team:{key:{eq:$t}}}){ nodes{ id name } } }', {'t': team})
     states = {s['name']: s['id'] for s in (st.get('workflowStates') or st['data']['workflowStates'])['nodes']}
     lb = gql('query{ issueLabels(first:250){ nodes{ id name parent{ name } } } }', {})
