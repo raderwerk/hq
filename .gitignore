@@ -1,0 +1,7 @@
+# Linear backups contain the previous workspace's issues (not for a public repo)
+linear/backup-*.json
+# local state
+.DS_Store
+__pycache__/
+*.pyc
+.env
