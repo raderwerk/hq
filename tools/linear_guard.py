@@ -58,7 +58,7 @@ def check_workspace(organization, org_arg, key_source):
 
 def newest_backup(directory):
     """Newest linear/backup-*.json. `.partial` exports do not match the glob."""
-    candidates = sorted(glob.glob(os.path.join(directory, "backup-*.json")))
+    candidates = sorted(glob.glob(os.path.join(directory, "backup-*.json")), key=os.path.getmtime)
     return candidates[-1] if candidates else None
 
 
