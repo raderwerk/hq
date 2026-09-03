@@ -54,8 +54,9 @@ def main():
     st = gql('query($t:String!){ workflowStates(filter:{team:{key:{eq:$t}}}){ nodes{ id name } } }', {'t': team})
     states = {s['name']: s['id'] for s in (st.get('workflowStates') or st['data']['workflowStates'])['nodes']}
     gql('mutation($id:String!,$b:String!){ commentCreate(input:{issueId:$id, body:$b}){ success } }', {'id': iid, 'b': body + f" PR: {pr}"})
-    gql('mutation($id:String!,$s:String!){ issueUpdate(id:$id, input:{stateId:$s}){ success } }', {'id': iid, 's': states['Agentreview']})
-    print(f'{issue}: {branch} updated with {sha}, PR {pr}, -> Agentreview')
+    target = 'QA op preview' if '--qa' in sys.argv else 'Agentreview'
+    gql('mutation($id:String!,$s:String!){ issueUpdate(id:$id, input:{stateId:$s}){ success } }', {'id': iid, 's': states[target]})
+    print(f'{issue}: {branch} updated with {sha}, PR {pr}, -> {target}')
 
 
 if __name__ == '__main__':
