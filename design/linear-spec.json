@@ -2163,7 +2163,7 @@
         "dienst/web",
         "soort/feature",
         "risico/hoog",
-        "agent/cursor",
+        "agent/codex",
         "geënsceneerd",
         "repo/raderwerk/zoutkaap-erp-bridge"
       ],
@@ -2395,7 +2395,7 @@
         "dienst/web",
         "soort/feature",
         "risico/midden",
-        "agent/cursor",
+        "agent/codex",
         "repo/raderwerk/kantelbeer-site"
       ],
       "priority": 2,
@@ -2563,7 +2563,7 @@
         "dienst/web",
         "soort/feature",
         "risico/midden",
-        "agent/cursor",
+        "agent/codex",
         "repo/raderwerk/spoorlinde-web"
       ],
       "priority": 2,
@@ -2606,7 +2606,7 @@
         "soort/feature",
         "risico/hoog",
         "risico-klantdata",
-        "agent/cursor",
+        "agent/codex",
         "repo/raderwerk/spoorlinde-web"
       ],
       "priority": 1,
